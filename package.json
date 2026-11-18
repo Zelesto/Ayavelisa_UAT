@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=20.6"
+  },
   "scripts": {
     "dev": "concurrently -k -n api,web \"pnpm run dev:api\" \"pnpm run dev:web\"",
     "dev:api": "pnpm run db:push && node --env-file-if-exists=.env --import tsx --watch server/index.ts",
@@ -11,11 +14,14 @@
     "start": "node --env-file-if-exists=.env --import tsx server/index.ts",
     "db:push": "prisma db push",
     "db:deploy": "prisma migrate deploy",
+    "db:reset": "prisma migrate reset --force",
+    "db:studio": "prisma studio",
     "preview": "vite preview",
     "check": "tsc --noEmit"
   },
   "dependencies": {
     "@fastify/helmet": "^13.2.0",
+    "@fastify/multipart": "^9.0.0",
     "@fastify/static": "^10.1.10",
     "@prisma/client": "^6.19.3",
     "@supabase/supabase-js": "^2.119.0",
