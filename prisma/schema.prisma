@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider  = "postgresql"
   url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
@@ -79,27 +79,30 @@ model Visit {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  case       CaseRecord @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  case       CaseRecord      @relation(fields: [caseId], references: [id], onDelete: Cascade)
   evidence   VisitEvidence[]
   grievances VisitGrievance[]
 
   @@index([caseId])
   @@index([status])
+  @@index([assignedTo])
+  @@index([scheduledFor])
 }
 
 model VisitEvidence {
-  id              String   @id
-  visitId         String
-  kind            String
-  category        String?
-  label           String
-  dataUrl         String   // base64; see "Photos" below
-  capturedAt      DateTime
-  sizeBytes       Int
-  provenance      Json?
+  id               String   @id
+  visitId          String
+  kind             String
+  category         String?
+  label            String
+  storagePath      String
+  mimeType         String
+  sizeBytes        Int
+  capturedAt       DateTime
+  provenance       Json?
   legibilityStatus String?
-  legibilityNote  String?
-  createdAt       DateTime @default(now())
+  legibilityNote   String?
+  createdAt        DateTime @default(now())
 
   visit Visit @relation(fields: [visitId], references: [id], onDelete: Cascade)
 
@@ -113,16 +116,20 @@ model VisitGrievance {
   raisedBy        String
   description     String
   category        String
+  categoryOther   String?
   status          String    @default("open")
   resolutionOwner String?
   dueDate         DateTime?
   resolution      String?
   resolvedAt      DateTime?
   createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   visit Visit @relation(fields: [visitId], references: [id], onDelete: Cascade)
 
   @@index([visitId])
+  @@index([status])
+  @@index([dueDate])
 }
 
 model Blocker {
@@ -155,13 +162,14 @@ model Activity {
   case CaseRecord? @relation(fields: [caseId], references: [id], onDelete: SetNull)
 
   @@index([caseId])
+  @@index([at])
 }
 
 model Intake {
-  id     String @id
-  status String @default("draft")
-  data   Json
-  version Int    @default(1)
+  id        String   @id
+  status    String   @default("draft")
+  data      Json
+  version   Int      @default(1)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
