@@ -9,6 +9,8 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import crypto from "node:crypto";
 import { registerVisitRoutes } from "./routes/visits.js";
+import { registerGeocodeRoutes } from "./routes/geocode.js";
+
 
 const prisma = new PrismaClient();
 const app = Fastify({
@@ -544,6 +546,7 @@ app.delete<{ Params: { id: string } }>("/api/admin/users/:id", async (request, r
 /* --- Visit routes (Slice 1) ---------------------------------------------- */
 
 await registerVisitRoutes(app, { prisma, supabaseAdmin });
+await registerGeocodeRoutes(app);
 
 /* --- Whole-workspace state (still used by the untouched pages) ----------- */
 
