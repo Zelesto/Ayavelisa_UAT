@@ -1,14 +1,21 @@
 import Fastify from "fastify";
 import helmet from "@fastify/helmet";
 import fastifyStatic from "@fastify/static";
+import multipart from "@fastify/multipart";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import crypto from "node:crypto";
+import { registerVisitRoutes } from "./routes/visits.js";
 
 const prisma = new PrismaClient();
-const app = Fastify({ logger: true, bodyLimit: 50 * 1024 * 1024 });
+const app = Fastify({
+  logger: true,
+  bodyLimit: 50 * 1024 * 1024,
+  trustProxy: process.env.TRUST_PROXY === "true",
+});
 const STATE_ID = "workspace";
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -77,12 +84,54 @@ const editableStateKeys: Record<AccountRole, ReadonlySet<string> | null> = {
 };
 
 await app.register(helmet, { contentSecurityPolicy: false });
+await app.register(multipart, {
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 25 },
+});
+
+/* --- Global error handler ------------------------------------------------ */
+/* Every route throws either a plain Error or one with a `code`/`statusCode`
+   attached. Convert it to a stable JSON shape so the client's ApiError can
+   parse it. Never leak stack traces in production. */
+app.setErrorHandler((error, request, reply) => {
+  const statusCode =
+    (typeof (error as { statusCode?: number }).statusCode === "number"
+      ? (error as { statusCode: number }).statusCode
+      : undefined) ?? (error as { status?: number }).status ?? 500;
+
+  const code =
+    (error as { code?: string }).code ??
+    (statusCode === 500 ? "internal_error" : error.name ?? "error");
+
+  if (statusCode >= 500) {
+    request.log.error({ err: error, code, requestId: request.id }, "Unhandled route error");
+  } else {
+    request.log.warn({ err: error.message, code, requestId: request.id }, "Handled route error");
+  }
+
+  const body: Record<string, unknown> = { error: code, requestId: request.id };
+  const issues = (error as { issues?: unknown }).issues;
+  if (issues) body.issues = issues;
+  const field = (error as { field?: unknown }).field;
+  if (field) body.field = field;
+  const sections = (error as { sections?: unknown }).sections;
+  if (sections) body.sections = sections;
+  const limit = (error as { limit?: unknown }).limit;
+  if (limit !== undefined) body.limit = limit;
+
+  // Never send the raw message for 5xx.
+  if (statusCode < 500 && error.message && error.message !== code) {
+    body.message = error.message;
+  }
+
+  return reply.code(statusCode).send(body);
+});
 
 app.decorateRequest("authUser", null);
 app.addHook("preHandler", async (request, reply) => {
   const route = request.url.split("?")[0];
   if (!route.startsWith("/api/") || route === "/api/health") return;
   if (!supabase) {
+    if (process.env.NODE_ENV !== "production" && process.env.ALLOW_DEV_AUTH_BYPASS === "true") return;
     if (process.env.NODE_ENV !== "production") return;
     return reply.code(503).send({ error: "authentication_unavailable" });
   }
@@ -139,13 +188,26 @@ app.addHook("preHandler", async (request, reply) => {
 });
 
 app.get("/api/health", async (request, reply) => {
+  const health: Record<string, unknown> = { ok: true, database: "connected", version: process.env.npm_package_version ?? "0.1.0" };
   try {
     await prisma.$queryRaw`SELECT 1`;
-    return { ok: true, database: "connected" };
   } catch (error) {
     request.log.error({ err: error }, "Database health check failed");
-    return reply.code(503).send({ ok: false, database: "unavailable" });
+    health.ok = false;
+    health.database = "unavailable";
   }
+  if (supabaseAdmin) {
+    try {
+      const { error } = await supabaseAdmin.storage.getBucket("visit-evidence");
+      health.storage = error ? "unavailable" : "connected";
+      if (error && health.ok) { health.ok = false; }
+    } catch {
+      health.storage = "unavailable";
+    }
+  } else {
+    health.storage = "not_configured";
+  }
+  return reply.code(health.ok ? 200 : 503).send(health);
 });
 
 app.get("/api/me", async (request, reply) => {
@@ -447,29 +509,43 @@ app.delete<{ Params: { id: string } }>("/api/admin/users/:id", async (request, r
         },
       });
 
-      const { error: authDeleteError } = await supabaseAdmin.auth.admin.deleteUser(current.id);
-      if (authDeleteError && authDeleteError.status !== 404) {
-        request.log.error({ status: authDeleteError.status, code: authDeleteError.code, subjectUserId: current.id }, "Could not delete account from Supabase Auth");
-        throw new Error("supabase_account_deletion_failed");
-      }
-
       await transaction.user.delete({ where: { id: current.id } });
       return { id: current.id, email: current.email };
     });
 
     if (!deletedUser) return reply.code(404).send({ error: "account_not_found" });
+
+    // Supabase delete happens AFTER the DB commit. If it fails, the app row
+    // is already gone, so log loudly for reconciliation rather than
+    // rolling back the whole thing.
+    const { error: authDeleteError } = await supabaseAdmin.auth.admin.deleteUser(deletedUser.id);
+    if (authDeleteError && authDeleteError.status !== 404) {
+      request.log.error(
+        { status: authDeleteError.status, code: authDeleteError.code, subjectUserId: deletedUser.id },
+        "DB account deleted but Supabase Auth deletion failed; auth identity remains",
+      );
+      return reply.code(200).send({
+        deleted: true,
+        user: deletedUser,
+        warning: "auth_identity_not_deleted",
+      });
+    }
+
     return { deleted: true, user: deletedUser };
   } catch (error) {
     if (error instanceof Error && error.message === "last_active_admin") {
       return reply.code(409).send({ error: "cannot_remove_last_active_admin" });
     }
-    if (error instanceof Error && error.message === "supabase_account_deletion_failed") {
-      return reply.code(502).send({ error: "supabase_account_deletion_failed" });
-    }
     request.log.error({ err: error, subjectUserId: request.params.id }, "Could not delete managed account");
     throw error;
   }
 });
+
+/* --- Visit routes (Slice 1) ---------------------------------------------- */
+
+await registerVisitRoutes(app, { prisma, supabaseAdmin });
+
+/* --- Whole-workspace state (still used by the untouched pages) ----------- */
 
 app.get("/api/state", async (_request, reply) => {
   reply.header("Cache-Control", "no-store");
