@@ -1,7 +1,18 @@
+/* =========================================================================
+   lib/store.ts
+   Hybrid store: visits are backed by Postgres via /api/visits/*, everything
+   else still goes through the whole-workspace /api/state blob. Slice 2 will
+   migrate cases, Slice 3 intakes.
+   ========================================================================= */
+
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
-  Activity, BeneficiaryLead, Blocker, CaseRecord, Evidence, Intake, LeadImportBatch, Persona, SeedKind, StoreState, VerifyNowResult, Visit, VisitForm,
+  Activity, Blocker, CaseRecord, Evidence, Intake, Persona, SeedKind, StoreState, VerifyNowResult, Visit, VisitForm,
 } from "./types";
+import { api, ApiError, uploadEvidence } from "./api";
+import {
+  enqueue, dequeue, listPending, markAttemptFailed, isExhausted, resetAttempts, type QueueEntry,
+} from "./offlineQueue";
 import { seedFor } from "./seeders";
 import { emptyIntake } from "./intake";
 import { authorizedFetch } from "./supabase";
@@ -12,7 +23,7 @@ const KEY = "ayavelisa:field:v2";
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 export const USERS: Record<Persona, { name: string; role: string; initials: string }> = {
-  fieldworker: { name: "Lindiwe Ndlovu", role: "Fieldworker Â· Ndlovu Ext. 2", initials: "LN" },
+  fieldworker: { name: "Lindiwe Ndlovu", role: "Fieldworker · Ndlovu Ext. 2", initials: "LN" },
   supervisor: { name: "Thandi Ndlovu", role: "Verification supervisor", initials: "TN" },
   reviewer: { name: "Sipho Mahlangu", role: "Project reviewer", initials: "SM" },
 };
@@ -33,13 +44,16 @@ type Ctx = StoreState & {
   assignCases: (ids: string[], assignee: string) => void;
   runVerifyNowChecks: (ids: string[]) => VerifyNowResult[];
   markDepartmentPacketExported: (id: string) => void;
-  startVisit: (id: string) => void;
-  saveVisitForm: (id: string, form: VisitForm) => void;
-  addEvidence: (id: string, ev: Omit<Evidence, "id">) => void;
-  removeEvidence: (id: string, evId: string) => void;
-  submitVisit: (id: string) => void;
-  returnVisit: (id: string, reason: string) => void;
-  approveVisit: (id: string) => void;
+
+  /* Visit mutations — all async now. */
+  startVisit: (id: string) => Promise<void>;
+  saveVisitForm: (id: string, form: VisitForm) => Promise<void>;
+  addEvidence: (id: string, ev: { evidenceId: string; file: Blob } & Omit<Evidence, "id">) => Promise<void>;
+  removeEvidence: (id: string, evId: string) => Promise<void>;
+  submitVisit: (id: string) => Promise<void>;
+  returnVisit: (id: string, reason: string) => Promise<void>;
+  approveVisit: (id: string) => Promise<void>;
+
   runSync: () => Promise<void>;
   requestBlocker: (c: string, b: string) => void;
   assignBlocker: (c: string, b: string) => void;
@@ -51,6 +65,16 @@ type Ctx = StoreState & {
   returnIntake: (id: string, reason: string) => void;
   linkIntake: (id: string, caseId: string, reason: string) => void;
   discardIntake: (id: string) => void;
+
+  /* New for Slice 1. */
+  visitsFromApi: Visit[];
+  visitsLoaded: boolean;
+  visitsLoading: boolean;
+  visitsError: ApiError | null;
+  pendingQueueCount: number;
+  refreshVisits: (opts?: { caseId?: string }) => Promise<void>;
+  refreshPendingQueue: () => Promise<void>;
+  retryStuckItem: (entry: QueueEntry) => Promise<void>;
 };
 
 const StoreContext = createContext<Ctx | null>(null);
@@ -95,6 +119,49 @@ function nextIntakeId(all: Intake[]): string {
   return `INT-${year}-${String(max + 1).padStart(4, "0")}`;
 }
 
+/** Convert an API Visit into the client Visit shape + version. */
+function visitFromApi(raw: any): Visit & { version: number } {
+  return {
+    id: raw.id,
+    caseId: raw.caseId,
+    assignedTo: raw.assignedTo,
+    scheduledFor: raw.scheduledFor,
+    status: raw.status,
+    form: raw.form,
+    summary: raw.summary ?? null,
+    evidence: (raw.evidence ?? []).map((e: any) => ({
+      id: e.id,
+      kind: e.kind,
+      category: e.category,
+      label: e.label,
+      mimeType: e.mimeType,
+      sizeBytes: e.sizeBytes,
+      capturedAt: e.capturedAt,
+      provenance: e.provenance,
+      legibilityStatus: e.legibilityStatus,
+      legibilityNote: e.legibilityNote,
+    })),
+    startedAt: raw.startedAt,
+    submittedAt: raw.submittedAt,
+    reviewedAt: raw.reviewedAt,
+    returnedAt: raw.returnedAt,
+    returnReason: raw.returnReason,
+    reviewedBy: raw.reviewedBy,
+    synced: raw.synced,
+    version: raw.version,
+  } as Visit & { version: number };
+}
+
+function upsertVisitLocal(list: Visit[], updated: Visit): Visit[] {
+  const idx = list.findIndex((v) => v.id === updated.id);
+  if (idx === -1) return [updated, ...list];
+  const next = list.slice();
+  next[idx] = updated;
+  return next;
+}
+
+const versionOf = (v: Visit | undefined): number => (v as any)?.version ?? 1;
+
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<StoreState>(load);
   const { user } = useAuth();
@@ -102,10 +169,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const currentUser = user
     ? { name: user.name, role: ROLE_LABELS[user.role], initials: userInitials(user.name, user.email) }
     : USERS[state.persona];
+
   const [isSyncing, setIsSyncing] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
   const [databaseStatus, setDatabaseStatusState] = useState<"loading" | "connected" | "saving" | "error">("loading");
   const [databaseError, setDatabaseError] = useState<string | null>(null);
+
+  const [visitsFromApi, setVisitsFromApi] = useState<Visit[]>([]);
+  const [visitsLoaded, setVisitsLoaded] = useState(false);
+  const [visitsLoading, setVisitsLoading] = useState(false);
+  const [visitsError, setVisitsError] = useState<ApiError | null>(null);
+  const [pendingQueueCount, setPendingQueueCount] = useState(0);
+  const flushInProgress = useRef(false);
+
   const databaseVersion = useRef(0);
   const databaseStatusRef = useRef(databaseStatus);
   const saveTimer = useRef<number | null>(null);
@@ -118,6 +194,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     databaseStatusRef.current = status;
     setDatabaseStatusState(status);
     setDatabaseError(error);
+  }, []);
+
+  /* --- /api/state blob ---------------------------------------------------- */
+
+  const refreshStateFromServer = useCallback(async () => {
+    try {
+      const response = await authorizedFetch("/api/state");
+      if (!response.ok) return;
+      const result = await response.json() as { state: StoreState | null; version: number };
+      databaseVersion.current = result.version;
+      if (result.state) {
+        lastSavedState.current = result.state;
+        setState(result.state);
+      }
+    } catch {
+      // Silent — the blob load effect will report errors on its own schedule.
+    }
   }, []);
 
   useEffect(() => {
@@ -219,11 +312,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     id: uid(), kind, tone, title, detail, time: "Just now", at: new Date().toISOString(),
   });
 
+  /* --- Persona / seed ---------------------------------------------------- */
+
   const setPersona = useCallback((nextPersona: Persona) => {
     if (!user) setState((s) => ({ ...s, persona: nextPersona }));
   }, [user]);
   const setSeed = useCallback((seedKind: SeedKind) => setState(() => seedFor(seedKind)), []);
   const resetDemo = useCallback(() => setState((s) => seedFor(s.seedKind)), []);
+
+  /* --- Case CRUD (still on the blob) ------------------------------------- */
+
   const createCase = useCallback((draft: Pick<CaseRecord, "name" | "household" | "project" | "location" | "source" | "members" | "site">) => {
     const year = new Date().getFullYear();
     const max = state.cases.reduce((highest, item) => {
@@ -253,6 +351,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }));
     return created;
   }, [state.cases, currentUser.name, persona]);
+
   const updateCaseRecord = useCallback((id: string, patch: Partial<CaseRecord>) => setState((s) => {
     const before = s.cases.find((item) => item.id === id);
     if (!before) throw new Error(`Case ${id} was not found`);
@@ -267,6 +366,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }, ...s.auditLog],
     };
   }), [currentUser.name, persona]);
+
   const archiveCase = useCallback((id: string) => setState((s) => {
     const before = s.cases.find((item) => item.id === id);
     if (!before) throw new Error(`Case ${id} was not found`);
@@ -281,6 +381,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }, ...s.auditLog],
     };
   }), [currentUser.name, persona]);
+
   const restoreCase = useCallback((id: string) => setState((s) => {
     const before = s.cases.find((item) => item.id === id);
     if (!before) throw new Error(`Case ${id} was not found`);
@@ -295,11 +396,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }, ...s.auditLog],
     };
   }), [currentUser.name, persona]);
+
   const assignCases = useCallback((ids: string[], assignee: string) => setState((s) => ({
     ...s,
     cases: s.cases.map((item) => ids.includes(item.id) && !item.archivedAt ? { ...item, assignedTo: assignee, updated: "Just now" } : item),
     activities: [act("action", "blue", "Cases assigned", `${ids.length} case(s) · ${assignee}`), ...s.activities].slice(0, 40),
   })), []);
+
   const runVerifyNowChecks = useCallback((ids: string[]) => {
     const selected = new Set(ids);
     const matchingCases = state.cases.filter((item) => selected.has(item.id));
@@ -326,47 +429,306 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }));
     return checks;
   }, [state.cases, currentUser.name]);
+
   const markDepartmentPacketExported = useCallback((id: string) => {
     updateCaseRecord(id, { departmentPacketExportedAt: new Date().toISOString() });
   }, [updateCaseRecord]);
 
-  const startVisit = useCallback((id: string) => setState((s) => ({ ...s, visits: s.visits.map((v) => v.id === id ? { ...v, status: v.status === "assigned" ? "in_progress" as const : v.status, startedAt: v.startedAt ?? new Date().toISOString() } : v) })), []);
-  const saveVisitForm = useCallback((id: string, form: VisitForm) => setState((s) => ({ ...s, visits: s.visits.map((v) => v.id === id ? { ...v, form } : v) })), []);
-  const addEvidence = useCallback((id: string, ev: Omit<Evidence, "id">) => setState((s) => ({ ...s, visits: s.visits.map((v) => v.id === id ? { ...v, evidence: [...v.evidence, { ...ev, id: uid() }] } : v) })), []);
-  const removeEvidence = useCallback((id: string, evId: string) => setState((s) => ({ ...s, visits: s.visits.map((v) => v.id === id ? { ...v, evidence: v.evidence.filter((e) => e.id !== evId) } : v) })), []);
-  const submitVisit = useCallback((id: string) => setState((s) => ({ ...s, visits: s.visits.map((v) => v.id === id ? { ...v, status: "captured" as const, submittedAt: new Date().toISOString(), synced: false } : v), sync: { ...s.sync, pendingUploads: s.sync.pendingUploads + 1 }, activities: [act("visit", "blue", "Visit submitted for review", id), ...s.activities].slice(0, 40) })), []);
-  const returnVisit = useCallback((id: string, reason: string) => setState((s) => {
-    const visit = s.visits.find((item) => item.id === id);
-    if (!visit) throw new Error(`Visit ${id} was not found`);
-    return {
-      ...s,
-      visits: s.visits.map((item) => item.id === id ? { ...item, status: "returned" as const, returnedAt: new Date().toISOString(), returnReason: reason, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name } : item),
-      cases: s.cases.map((item) => item.id === visit.caseId ? { ...item, verification: "Returned for correction", verificationTone: "warning", readiness: "Review returned", nextAction: "Correct visit and resubmit", updated: "Just now" } : item),
-      activities: [act("visit", "coral", "Visit returned", id), ...s.activities].slice(0, 40),
+  /* --- Visits: load ------------------------------------------------------ */
+
+  const refreshVisits = useCallback(async (opts?: { caseId?: string }) => {
+    setVisitsLoading(true);
+    setVisitsError(null);
+    try {
+      const query = opts?.caseId ? `?caseId=${encodeURIComponent(opts.caseId)}` : "";
+      const result = await api.get<{ visits: any[] }>(`/api/visits${query}`);
+      setVisitsFromApi(result.visits.map((v) => visitFromApi(v)));
+      setVisitsLoaded(true);
+    } catch (e) {
+      setVisitsError(e instanceof ApiError ? e : new ApiError("network_error", 0));
+    } finally {
+      setVisitsLoading(false);
+    }
+  }, []);
+
+  const refreshPendingQueue = useCallback(async () => {
+    const pending = await listPending();
+    setPendingQueueCount(pending.length);
+  }, []);
+
+  useEffect(() => {
+    void refreshVisits();
+    void refreshPendingQueue();
+  }, [refreshVisits, refreshPendingQueue]);
+
+  /* --- Visits: mutations ------------------------------------------------- */
+
+  const startVisit = useCallback(async (id: string) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+    const startedAt = current.startedAt ?? new Date().toISOString();
+    const result = await api.patch<any>(`/api/visits/${id}`, {
+      version: versionOf(current),
+      status: "in_progress",
+      startedAt,
+    });
+    setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
+  }, [visitsFromApi]);
+
+  const saveVisitForm = useCallback(async (id: string, form: VisitForm) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+    const result = await api.patch<any>(`/api/visits/${id}`, {
+      version: versionOf(current),
+      form: form as unknown as Record<string, unknown>,
+    });
+    setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
+  }, [visitsFromApi]);
+
+  const addEvidence = useCallback(async (
+    id: string,
+    ev: { evidenceId: string; file: Blob } & Omit<Evidence, "id">,
+  ) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+
+    // Optimistic placeholder so the UI shows progress.
+    const placeholder: Evidence = {
+      id: ev.evidenceId,
+      kind: ev.kind,
+      category: ev.category,
+      label: ev.label,
+      mimeType: ev.mimeType,
+      sizeBytes: ev.sizeBytes,
+      capturedAt: ev.capturedAt,
+      provenance: ev.provenance,
+      legibilityStatus: ev.legibilityStatus,
+      legibilityNote: ev.legibilityNote,
     };
-  }), [currentUser.name]);
-  const approveVisit = useCallback((id: string) => setState((s) => {
-    const visit = s.visits.find((item) => item.id === id);
-    if (!visit) throw new Error(`Visit ${id} was not found`);
-    return {
-      ...s,
-      visits: s.visits.map((item) => item.id === id ? { ...item, status: "approved" as const, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name } : item),
-      cases: s.cases.map((item) => {
-        if (item.id !== visit.caseId) return item;
-        const check = item.verifyNowChecks?.at(-1);
-        const verifyPassed = check?.status === "completed" && check.outcome === "match";
-        return {
-          ...item,
-          verification: "Field review approved",
-          verificationTone: "success",
-          readiness: verifyPassed ? "Ready for department" : "Blocked · VerifyNow required",
-          nextAction: verifyPassed ? "Prepare department handoff packet" : "Complete VerifyNow identity check",
-          updated: "Just now",
-        };
-      }),
-      activities: [act("visit", "sage", "Visit approved", id), ...s.activities].slice(0, 40),
+    setVisitsFromApi((list) =>
+      list.map((v) => v.id === id ? { ...v, evidence: [...v.evidence, placeholder] } : v),
+    );
+
+    const queueEntry = {
+      kind: "evidence" as const,
+      evidenceId: ev.evidenceId,
+      visitId: id,
+      file: ev.file,
+      meta: {
+        kind: ev.kind,
+        category: ev.category,
+        label: ev.label,
+        capturedAt: ev.capturedAt,
+        provenance: ev.provenance as Record<string, unknown> | undefined,
+      },
+      queuedAt: new Date().toISOString(),
+      attempts: 0,
+      lastError: null,
     };
-  }), [currentUser.name]);
+
+    if (!isOnline) {
+      await enqueue(queueEntry);
+      await refreshPendingQueue();
+      return;
+    }
+
+    try {
+      const fd = new FormData();
+      fd.append("file", ev.file, `${ev.evidenceId}.jpg`);
+      fd.append("id", ev.evidenceId);
+      fd.append("kind", ev.kind);
+      if (ev.category) fd.append("category", ev.category);
+      fd.append("label", ev.label);
+      fd.append("capturedAt", ev.capturedAt);
+      if (ev.provenance) fd.append("provenance", JSON.stringify(ev.provenance));
+
+      const result = await uploadEvidence<{ evidence: any }>(`/api/visits/${id}/evidence`, fd);
+      setVisitsFromApi((list) =>
+        list.map((v) => {
+          if (v.id !== id) return v;
+          const others = v.evidence.filter((e) => e.id !== ev.evidenceId);
+          return { ...v, evidence: [...others, result.evidence] };
+        }),
+      );
+    } catch (e) {
+      // Network/5xx → queue it and keep the placeholder.
+      if (e instanceof ApiError && e.status >= 500) {
+        await enqueue(queueEntry);
+        await refreshPendingQueue();
+        return;
+      }
+      // Anything else (413, 415, 409, 403) → roll back the placeholder.
+      setVisitsFromApi((list) =>
+        list.map((v) => v.id === id ? { ...v, evidence: v.evidence.filter((e) => e.id !== ev.evidenceId) } : v),
+      );
+      throw e;
+    }
+  }, [visitsFromApi, isOnline, refreshPendingQueue]);
+
+  const removeEvidence = useCallback(async (id: string, evId: string) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+
+    setVisitsFromApi((list) =>
+      list.map((v) => v.id === id ? { ...v, evidence: v.evidence.filter((e) => e.id !== evId) } : v),
+    );
+
+    try {
+      await api.delete(`/api/visits/${id}/evidence/${evId}`);
+    } catch (e) {
+      setVisitsFromApi((list) => upsertVisitLocal(list, current));
+      throw e;
+    }
+  }, [visitsFromApi]);
+
+  const submitVisit = useCallback(async (id: string) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+    const form = current.form;
+    if (!form) throw new ApiError("submission_incomplete", 400, { reason: "form missing" });
+
+    const grievances = (form.grievances ?? []).map((g) => ({
+      id: g.id,
+      raisedAt: g.raisedAt,
+      raisedBy: g.raisedBy,
+      description: g.description,
+      category: g.category,
+      categoryOther: g.categoryOther,
+      status: g.status,
+      resolutionOwner: g.resolutionOwner,
+      dueDate: g.dueDate,
+      resolution: g.resolution,
+      resolvedAt: g.resolvedAt,
+    }));
+
+    const submittedAt = new Date().toISOString();
+    const payload = {
+      version: versionOf(current),
+      form: form as unknown as Record<string, unknown>,
+      summary: (current.summary ?? null) as Record<string, unknown> | null,
+      grievances,
+      submittedAt,
+    };
+
+    const queueEntry = {
+      kind: "visit-submit" as const,
+      visitId: id,
+      ...payload,
+      queuedAt: submittedAt,
+      attempts: 0,
+      lastError: null,
+    };
+
+    if (!isOnline) {
+      await enqueue(queueEntry);
+      setVisitsFromApi((list) =>
+        list.map((v) => v.id === id ? { ...v, status: "captured", submittedAt, synced: false } : v),
+      );
+      await refreshPendingQueue();
+      return;
+    }
+
+    try {
+      const result = await api.post<any>(`/api/visits/${id}/submit`, payload);
+      setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
+    } catch (e) {
+      if (e instanceof ApiError && e.status >= 500) {
+        await enqueue(queueEntry);
+        setVisitsFromApi((list) =>
+          list.map((v) => v.id === id ? { ...v, status: "captured", submittedAt, synced: false } : v),
+        );
+        await refreshPendingQueue();
+        return;
+      }
+      throw e;
+    }
+  }, [visitsFromApi, isOnline, refreshPendingQueue]);
+
+  const returnVisit = useCallback(async (id: string, reason: string) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+    const result = await api.post<any>(`/api/visits/${id}/return`, { version: versionOf(current), reason });
+    setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
+    void refreshStateFromServer();
+  }, [visitsFromApi, refreshStateFromServer]);
+
+  const approveVisit = useCallback(async (id: string) => {
+    const current = visitsFromApi.find((v) => v.id === id);
+    if (!current) throw new ApiError("visit_not_found", 404);
+    const result = await api.post<any>(`/api/visits/${id}/approve`, { version: versionOf(current) });
+    setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
+    void refreshStateFromServer();
+  }, [visitsFromApi, refreshStateFromServer]);
+
+  /* --- Offline flusher --------------------------------------------------- */
+
+  const flushQueue = useCallback(async () => {
+    if (flushInProgress.current || !isOnline) return;
+    flushInProgress.current = true;
+    try {
+      const pending = await listPending();
+      for (const entry of pending) {
+        if (isExhausted(entry)) continue;
+        try {
+          if (entry.kind === "evidence") {
+            const fd = new FormData();
+            fd.append("file", entry.file, `${entry.evidenceId}.jpg`);
+            fd.append("id", entry.evidenceId);
+            fd.append("kind", entry.meta.kind);
+            if (entry.meta.category) fd.append("category", entry.meta.category);
+            fd.append("label", entry.meta.label);
+            fd.append("capturedAt", entry.meta.capturedAt);
+            if (entry.meta.provenance) fd.append("provenance", JSON.stringify(entry.meta.provenance));
+
+            const result = await uploadEvidence<{ evidence: any }>(`/api/visits/${entry.visitId}/evidence`, fd);
+            setVisitsFromApi((list) =>
+              list.map((v) => {
+                if (v.id !== entry.visitId) return v;
+                const others = v.evidence.filter((e) => e.id !== entry.evidenceId);
+                return { ...v, evidence: [...others, result.evidence] };
+              }),
+            );
+            await dequeue(entry);
+          } else {
+            const result = await api.post<any>(`/api/visits/${entry.visitId}/submit`, {
+              version: entry.version,
+              form: entry.form,
+              summary: entry.summary,
+              grievances: entry.grievances,
+              submittedAt: entry.submittedAt,
+            });
+            setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
+            await dequeue(entry);
+          }
+        } catch (e) {
+          const msg = e instanceof ApiError ? e.code : (e instanceof Error ? e.message : "unknown");
+          await markAttemptFailed(entry, msg);
+          // 401: session gone, stop the whole flush.
+          if (e instanceof ApiError && e.status === 401) break;
+          // 409: version moved — drop this submit and refresh so the user re-submits.
+          if (e instanceof ApiError && e.status === 409) {
+            await dequeue(entry);
+            await refreshVisits();
+          }
+        }
+      }
+      await refreshPendingQueue();
+    } finally {
+      flushInProgress.current = false;
+    }
+  }, [isOnline, refreshPendingQueue, refreshVisits]);
+
+  useEffect(() => {
+    if (!isOnline) return;
+    void flushQueue();
+  }, [isOnline, flushQueue]);
+
+  const retryStuckItem = useCallback(async (entry: QueueEntry) => {
+    await resetAttempts(entry);
+    if (isOnline) await flushQueue();
+  }, [isOnline, flushQueue]);
+
+  /* --- runSync (still the blob, but now nudges the visit queue too) ------ */
 
   const runSync = useCallback(async () => {
     setIsSyncing(true);
@@ -405,6 +767,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       databaseVersion.current = result.version;
       lastSavedState.current = nextState;
       setState(nextState);
+
+      // Flush any pending visit evidence/submits too.
+      await flushQueue();
     } catch (error) {
       const message = error instanceof Error ? error.message : "Database sync failed";
       setDatabaseStatus("error", message);
@@ -414,7 +779,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       writeInProgress.current = false;
       setIsSyncing(false);
     }
-  }, [state, databaseError, setDatabaseStatus]);
+  }, [state, databaseError, setDatabaseStatus, flushQueue]);
+
+  /* --- Blockers (still blob) --------------------------------------------- */
 
   const setBlocker = useCallback((caseId: string, blockerId: string, status: Blocker["status"], verb: string) => {
     setState((s) => {
@@ -422,13 +789,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (!list.find((b) => b.id === blockerId)) return s;
       const updated = list.map((b) => b.id === blockerId ? { ...b, status } : b);
       const open = updated.filter((b) => b.status !== "resolved");
-      const cases = s.cases.map((c) => c.id === caseId ? { ...c, readiness: open.length === 0 ? "Ready for works" : `Blocked Â· ${open.length} gate${open.length > 1 ? "s" : ""}`, nextAction: open.length === 0 ? "Confirm builder pack" : open[0].action, updated: "Just now" } : c);
+      const cases = s.cases.map((c) => c.id === caseId ? { ...c, readiness: open.length === 0 ? "Ready for works" : `Blocked · ${open.length} gate${open.length > 1 ? "s" : ""}`, nextAction: open.length === 0 ? "Confirm builder pack" : open[0].action, updated: "Just now" } : c);
       return { ...s, blockers: { ...s.blockers, [caseId]: updated }, cases, activities: [act("gate", status === "resolved" ? "sage" : "sand", verb, caseId), ...s.activities].slice(0, 40) };
     });
   }, []);
   const requestBlocker = useCallback((c: string, b: string) => setBlocker(c, b, "requested", "Gate requested"), [setBlocker]);
   const assignBlocker = useCallback((c: string, b: string) => setBlocker(c, b, "assigned", "Gate assigned"), [setBlocker]);
   const resolveBlocker = useCallback((c: string, b: string) => setBlocker(c, b, "resolved", "Gate resolved"), [setBlocker]);
+
+  /* --- Intakes (still blob, Slice 3 migrates) ---------------------------- */
 
   const createIntakeDraft = useCallback((): Intake => {
     let created: Intake | null = null;
@@ -445,7 +814,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const submitIntake = useCallback((id: string) => setState((s) => ({ ...s, intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "submitted" as const, submittedAt: new Date().toISOString() } : i), activities: [act("intake", "blue", "Intake submitted for review", id), ...s.activities].slice(0, 40) })), []);
 
-  const returnIntake = useCallback((id: string, reason: string) => setState((s) => ({ ...s, intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "returned" as const, returnedAt: new Date().toISOString(), returnReason: reason, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name } : i), activities: [act("intake", "coral", "Intake returned", `${id} Â· ${reason.slice(0, 40)}`), ...s.activities].slice(0, 40) })), [currentUser.name]);
+  const returnIntake = useCallback((id: string, reason: string) => setState((s) => ({ ...s, intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "returned" as const, returnedAt: new Date().toISOString(), returnReason: reason, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name } : i), activities: [act("intake", "coral", "Intake returned", `${id} · ${reason.slice(0, 40)}`), ...s.activities].slice(0, 40) })), [currentUser.name]);
 
   const approveIntake = useCallback((id: string): CaseRecord | null => {
     let newCase: CaseRecord | null = null;
@@ -456,7 +825,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const maxCase = s.cases.reduce((m, c) => { const n = Number(c.id.split("-")[2]); return Number.isFinite(n) && n > m ? n : m; }, 121);
       const caseId = `AY-${year}-${String(maxCase + 1).padStart(4, "0")}`;
       const surname = intake.applicantSurname.trim();
-      const locality = [intake.location.village, intake.location.ward].filter(Boolean).join(" Â· ");
+      const locality = [intake.location.village, intake.location.ward].filter(Boolean).join(" · ");
       const sources = intake.programmes.map((p) => ({ listName: p.listName, reference: p.reference, importedAt: new Date().toISOString() }));
       newCase = {
         id: caseId,
@@ -491,15 +860,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         cases: [newCase, ...s.cases],
         visits: [visit, ...s.visits],
         intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "approved" as const, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name, createdCaseId: caseId } : i),
-        activities: [act("intake", "sage", "Intake approved", `${id} â†’ ${caseId}`), act("visit", "blue", "Verification visit scheduled", visit.id), ...s.activities].slice(0, 40),
+        activities: [act("intake", "sage", "Intake approved", `${id} → ${caseId}`), act("visit", "blue", "Verification visit scheduled", visit.id), ...s.activities].slice(0, 40),
       };
     });
     return newCase;
   }, [currentUser.name]);
 
-  const linkIntake = useCallback((id: string, caseId: string, reason: string) => setState((s) => ({ ...s, intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "linked_to_existing" as const, linkedToCaseId: caseId, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name, duplicateResolution: "linked" as const, duplicateResolutionReason: reason } : i), activities: [act("intake", "sage", "Intake linked to existing case", `${id} â†’ ${caseId}`), ...s.activities].slice(0, 40) })), [currentUser.name]);
+  const linkIntake = useCallback((id: string, caseId: string, reason: string) => setState((s) => ({ ...s, intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "linked_to_existing" as const, linkedToCaseId: caseId, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name, duplicateResolution: "linked" as const, duplicateResolutionReason: reason } : i), activities: [act("intake", "sage", "Intake linked to existing case", `${id} → ${caseId}`), ...s.activities].slice(0, 40) })), [currentUser.name]);
 
   const discardIntake = useCallback((id: string) => setState((s) => ({ ...s, intakes: s.intakes.filter((i) => i.id !== id) })), []);
+
+  /* --- Context value ----------------------------------------------------- */
 
   const value = useMemo<Ctx>(() => ({
     ...state, persona, currentUser, isOnline, isSyncing,
@@ -509,7 +880,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,
     requestBlocker, assignBlocker, resolveBlocker,
     createIntakeDraft, saveIntake, submitIntake, approveIntake, returnIntake, linkIntake, discardIntake,
-  }), [state, persona, currentUser, isOnline, isSyncing, databaseStatus, databaseError, retryDatabase, setPersona, setSeed, resetDemo, createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported, startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync, requestBlocker, assignBlocker, resolveBlocker, createIntakeDraft, saveIntake, submitIntake, approveIntake, returnIntake, linkIntake, discardIntake]);
+    visitsFromApi, visitsLoaded, visitsLoading, visitsError,
+    pendingQueueCount, refreshVisits, refreshPendingQueue, retryStuckItem,
+  }), [
+    state, persona, currentUser, isOnline, isSyncing, databaseStatus, databaseError, retryDatabase,
+    setPersona, setSeed, resetDemo,
+    startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
+    createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,
+    requestBlocker, assignBlocker, resolveBlocker,
+    createIntakeDraft, saveIntake, submitIntake, approveIntake, returnIntake, linkIntake, discardIntake,
+    visitsFromApi, visitsLoaded, visitsLoading, visitsError,
+    pendingQueueCount, refreshVisits, refreshPendingQueue, retryStuckItem,
+  ]);
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }
