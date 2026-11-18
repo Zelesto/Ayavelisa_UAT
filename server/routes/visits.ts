@@ -1,7 +1,7 @@
 /* =========================================================================
    server/routes/visits.ts
-   Visit CRUD, evidence upload (Supabase Storage), grievances, and the
-   submit/return/approve state machine.
+   Visit CRUD, evidence upload (Supabase Storage), grievances, the
+   submit/return/approve state machine, and reverse geocoding.
    ========================================================================= */
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
@@ -178,7 +178,70 @@ async function updateVisitGuarded(
   return result.count === 1;
 }
 
-/* --- Routes ------------------------------------------------------------- */
+/* --- Reverse geocode ---------------------------------------------------- */
+
+const NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse";
+const NOMINATIM_USER_AGENT = process.env.NOMINATIM_USER_AGENT
+  ?? "Ayavelisa-HumanSettlements/0.1 (ops@ayavelisa.example)";
+const GEOCODE_TIMEOUT_MS = 5000;
+
+type NominatimResponse = {
+  display_name?: string;
+  address?: Record<string, string>;
+  lat?: string;
+  lon?: string;
+};
+
+function pickAddressField(addr: Record<string, string> | undefined, keys: string[]): string | null {
+  if (!addr) return null;
+  for (const k of keys) {
+    const v = addr[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+async function reverseGeocode(lat: number, lng: number): Promise<{
+  formatted: string | null;
+  village: string | null;
+  ward: string | null;
+  municipality: string | null;
+  province: string | null;
+  country: string | null;
+  postcode: string | null;
+  approximate: true;
+  provider: "nominatim";
+  raw: Record<string, string> | null;
+  fetchedAt: string;
+} | null> {
+  const url = `${NOMINATIM_URL}?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&format=jsonv2&addressdetails=1&accept-language=en`;
+  try {
+    const response = await fetch(url, {
+      headers: { "User-Agent": NOMINATIM_USER_AGENT, Accept: "application/json" },
+      signal: AbortSignal.timeout(GEOCODE_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const data = await response.json() as NominatimResponse;
+    const addr = data.address;
+    return {
+      formatted: data.display_name ?? null,
+      village: pickAddressField(addr, ["village", "hamlet", "suburb", "neighbourhood", "town"]),
+      ward: pickAddressField(addr, ["city_district", "suburb", "county", "municipality"]),
+      municipality: pickAddressField(addr, ["city", "municipality", "state_district"]),
+      province: pickAddressField(addr, ["state", "region"]),
+      country: pickAddressField(addr, ["country"]),
+      postcode: pickAddressField(addr, ["postcode"]),
+      approximate: true,
+      provider: "nominatim",
+      raw: addr ?? null,
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* --- Route registration ------------------------------------------------- */
 
 export async function registerVisitRoutes(
   app: FastifyInstance,
@@ -186,6 +249,7 @@ export async function registerVisitRoutes(
 ) {
   const { prisma, supabaseAdmin } = deps;
 
+  /* -------- List --------------------------------------------------- */
   app.get("/api/visits", async (request: FastifyRequest, reply: FastifyReply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -219,62 +283,7 @@ export async function registerVisitRoutes(
     return { visits: visits.map((v) => serializeVisit(v)) };
   });
 
-
-   // Add a new route alongside the visit routes
-app.post("/api/geocode/reverse", async (request, reply) => {
-  const parsed = z.object({
-    lat: z.number().min(-90).max(90),
-    lng: z.number().min(-180).max(180),
-  }).safeParse(request.body);
-
-  if (!parsed.success) {
-    return reply.code(400).send({ error: "invalid_coordinates" });
-  }
-
-  const { lat, lng } = parsed.data;
-  const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2&addressdetails=1&accept-language=en`;
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        // Nominatim requires a descriptive User-Agent with contact info
-        "User-Agent": "Ayavelisa-HumanSettlements/0.1 (admin@yourdomain.co.za)",
-        "Accept": "application/json",
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return reply.code(502).send({ error: "geocode_provider_failed" });
-    }
-
-    const data = await response.json() as {
-      display_name?: string;
-      address?: Record<string, string>;
-      lat: string;
-      lon: string;
-    };
-
-    // Extract the fields useful for your app
-    const addr = data.address ?? {};
-    return {
-      formatted: data.display_name ?? null,
-      // These map well to your VisitForm.location fields
-      village: addr.village ?? addr.hamlet ?? addr.suburb ?? addr.town ?? null,
-      ward: addr.city_district ?? addr.suburb ?? addr.county ?? null,
-      municipality: addr.city ?? addr.municipality ?? addr.state ?? null,
-      province: addr.state ?? null,
-      country: addr.country ?? null,
-      postcode: addr.postcode ?? null,
-      raw: data.address ?? null,
-      approximate: true,  // always true for reverse geocode
-    };
-  } catch (error) {
-    request.log.warn({ err: error, lat, lng }, "Reverse geocode failed");
-    return reply.code(502).send({ error: "geocode_unavailable" });
-  }
-});
-   
+  /* -------- Get one ------------------------------------------------ */
   app.get<{ Params: { id: string } }>("/api/visits/:id", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -290,6 +299,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     return { visit: serializeVisit(visit) };
   });
 
+  /* -------- Patch (start / form edits) ---------------------------- */
   app.patch<{ Params: { id: string } }>("/api/visits/:id", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -322,6 +332,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     return { visit: serializeVisit(updated!) };
   });
 
+  /* -------- Evidence upload --------------------------------------- */
   app.post<{ Params: { id: string } }>("/api/visits/:id/evidence", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -404,6 +415,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     return reply.code(201).send({ evidence: serializeEvidence(created) });
   });
 
+  /* -------- Evidence read (302 signed URL) ------------------------ */
   app.get<{ Params: { id: string; evidenceId: string } }>(
     "/api/visits/:id/evidence/:evidenceId",
     async (request, reply) => {
@@ -427,6 +439,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     },
   );
 
+  /* -------- Evidence delete --------------------------------------- */
   app.delete<{ Params: { id: string; evidenceId: string } }>(
     "/api/visits/:id/evidence/:evidenceId",
     async (request, reply) => {
@@ -449,6 +462,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     },
   );
 
+  /* -------- Submit ------------------------------------------------ */
   app.post<{ Params: { id: string } }>("/api/visits/:id/submit", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -524,6 +538,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     return { visit: serializeVisit(result!) };
   });
 
+  /* -------- Return ------------------------------------------------ */
   app.post<{ Params: { id: string } }>("/api/visits/:id/return", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -588,6 +603,7 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     return { visit: serializeVisit(result!) };
   });
 
+  /* -------- Approve ----------------------------------------------- */
   app.post<{ Params: { id: string } }>("/api/visits/:id/approve", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -649,6 +665,27 @@ app.post("/api/geocode/reverse", async (request, reply) => {
     });
 
     return { visit: serializeVisit(result!) };
+  });
+
+  /* -------- Reverse geocode (server-side proxy) ------------------- */
+  app.post("/api/geocode/reverse", async (request, reply) => {
+    const actor = request.authUser;
+    if (!actor) return reply.code(401).send({ error: "unauthorized" });
+
+    const parsed = z.object({
+      lat: z.number().min(-90).max(90),
+      lng: z.number().min(-180).max(180),
+    }).safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "invalid_coordinates", issues: parsed.error.issues });
+    }
+
+    const result = await reverseGeocode(parsed.data.lat, parsed.data.lng);
+    if (!result) {
+      return reply.code(502).send({ error: "geocode_unavailable" });
+    }
+    return result;
   });
 }
 
