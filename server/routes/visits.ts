@@ -1,9 +1,7 @@
 /* =========================================================================
    server/routes/visits.ts
-   Visit CRUD, evidence upload, grievances, and the submit/return/approve
-   state machine. All evidence goes to Supabase Storage (bucket:
-   visit-evidence). Grievances are nested in the wire format but stored
-   as first-class rows for queryability.
+   Visit CRUD, evidence upload (Supabase Storage), grievances, and the
+   submit/return/approve state machine.
    ========================================================================= */
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
@@ -13,7 +11,7 @@ import { z } from "zod";
 import crypto from "node:crypto";
 
 const BUCKET = "visit-evidence";
-const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024; // 10 MB hard cap
+const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
 const MAX_EVIDENCE_PER_VISIT = 25;
 
 /* --- Validation --------------------------------------------------------- */
@@ -49,13 +47,10 @@ const GrievanceInput = z.object({
   resolvedAt: z.string().datetime().nullable().optional(),
 }).strict();
 
-// VisitForm is opaque to the server in this slice — we store it as JSON.
-// Schema validation of the form is a Slice 2 concern (when Case/Intake
-// field mapping lands). For now we require it to be an object.
 const VisitFormInput = z.record(z.string(), z.unknown());
 
 const SubmitVisitBody = z.object({
-  version: z.number().int().nonnegative(),   // optimistic lock vs Visit.version
+  version: z.number().int().nonnegative(),
   form: VisitFormInput,
   summary: z.record(z.string(), z.unknown()).nullable().optional(),
   grievances: z.array(GrievanceInput).max(50).default([]),
@@ -65,7 +60,7 @@ const SubmitVisitBody = z.object({
 const PatchVisitBody = z.object({
   version: z.number().int().nonnegative(),
   form: VisitFormInput.optional(),
-  status: z.enum(["assigned", "in_progress"]).optional(),  // only these two are PATCH-able
+  status: z.enum(["assigned", "in_progress"]).optional(),
   startedAt: z.string().datetime().nullable().optional(),
 }).strict();
 
@@ -84,22 +79,17 @@ function sha256(buf: Buffer): string {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
-/** Detect MIME type from magic bytes. Returns null if not an accepted type. */
 function sniffImageOrPdf(buf: Buffer): { mimeType: string; ext: string } | null {
   if (buf.length < 12) return null;
-  // JPEG: FF D8 FF
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
     return { mimeType: "image/jpeg", ext: "jpg" };
   }
-  // PNG: 89 50 4E 47 0D 0A 1A 0A
   if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
     return { mimeType: "image/png", ext: "png" };
   }
-  // WebP: "RIFF" .... "WEBP"
   if (buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") {
     return { mimeType: "image/webp", ext: "webp" };
   }
-  // PDF: "%PDF"
   if (buf.toString("ascii", 0, 4) === "%PDF") {
     return { mimeType: "application/pdf", ext: "pdf" };
   }
@@ -116,15 +106,23 @@ function parseField<T>(value: unknown, schema: z.ZodType<T>, field: string): T {
   return parsed.data;
 }
 
-function isMultipart(request: FastifyRequest): boolean {
-  return request.isMultipart();
+function parseProvenanceField(raw: string): z.infer<typeof Provenance> | undefined {
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    throw Object.assign(new Error("invalid_provenance"), {
+      statusCode: 400, code: "invalid_provenance", field: "provenance",
+    });
+  }
+  return parseField(json, Provenance, "provenance");
 }
 
 async function readMultipart(request: FastifyRequest): Promise<{
   fields: Record<string, string>;
   file: { buffer: Buffer; filename: string };
 }> {
-  if (!isMultipart(request)) {
+  if (!request.isMultipart()) {
     throw Object.assign(new Error("multipart_required"), { statusCode: 415, code: "multipart_required" });
   }
   const fields: Record<string, string> = {};
@@ -132,8 +130,8 @@ async function readMultipart(request: FastifyRequest): Promise<{
 
   for await (const part of request.parts()) {
     if (part.type === "file") {
-      if (part.fieldname !== "file") { await part.toBuffer(); continue; } // discard unknowns
-      if (file) { await part.toBuffer(); continue; }                      // ignore second file
+      if (part.fieldname !== "file") { await part.toBuffer(); continue; }
+      if (file) { await part.toBuffer(); continue; }
       const buffer = await part.toBuffer();
       if (buffer.length > MAX_EVIDENCE_BYTES) {
         throw Object.assign(new Error("evidence_too_large"), { statusCode: 413, code: "evidence_too_large" });
@@ -149,7 +147,6 @@ async function readMultipart(request: FastifyRequest): Promise<{
   return { fields, file };
 }
 
-/** Assert the visit exists and the requester may touch it. */
 async function loadVisitForWrite(
   prisma: PrismaClient,
   visitId: string,
@@ -162,18 +159,12 @@ async function loadVisitForWrite(
   if (!visit) {
     throw Object.assign(new Error("visit_not_found"), { statusCode: 404, code: "visit_not_found" });
   }
-  const isFieldworker = actor.role === "fieldworker";
-  const isSupervisor = actor.role === "supervisor" || actor.role === "admin";
-  if (isFieldworker && visit.assignedTo !== actor.id) {
-    throw Object.assign(new Error("visit_forbidden"), { statusCode: 403, code: "visit_forbidden" });
-  }
-  if (!isFieldworker && !isSupervisor && actor.role !== "reviewer") {
+  if (actor.role === "fieldworker" && visit.assignedTo !== actor.id) {
     throw Object.assign(new Error("visit_forbidden"), { statusCode: 403, code: "visit_forbidden" });
   }
   return visit;
 }
 
-/** Optimistic lock: updateMany with version guard. */
 async function updateVisitGuarded(
   prisma: PrismaClient,
   visitId: string,
@@ -195,7 +186,6 @@ export async function registerVisitRoutes(
 ) {
   const { prisma, supabaseAdmin } = deps;
 
-  // -------- List ------------------------------------------------------
   app.get("/api/visits", async (request: FastifyRequest, reply: FastifyReply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -217,7 +207,6 @@ export async function registerVisitRoutes(
       if (query.from) where.scheduledFor.gte = new Date(query.from);
       if (query.to) where.scheduledFor.lte = new Date(query.to);
     }
-    // Fieldworkers only see their own visits, regardless of ?assignedTo.
     if (actor.role === "fieldworker") where.assignedTo = actor.id;
     else if (query.assignedTo) where.assignedTo = query.assignedTo;
 
@@ -225,27 +214,18 @@ export async function registerVisitRoutes(
       where,
       orderBy: { scheduledFor: "asc" },
       take: query.limit,
-      include: {
-        evidence: true,
-        grievances: true,
-        case: { select: { id: true, name: true, household: true, project: true, location: true } },
-      },
+      include: { evidence: true, grievances: true },
     });
-    return { visits: visits.map(serializeVisit) };
+    return { visits: visits.map((v) => serializeVisit(v)) };
   });
 
-  // -------- Get one ---------------------------------------------------
   app.get<{ Params: { id: string } }>("/api/visits/:id", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
 
     const visit = await prisma.visit.findUnique({
       where: { id: request.params.id },
-      include: {
-        evidence: true,
-        grievances: true,
-        case: { select: { id: true, name: true, household: true, project: true, location: true } },
-      },
+      include: { evidence: true, grievances: true },
     });
     if (!visit) return reply.code(404).send({ error: "visit_not_found" });
     if (actor.role === "fieldworker" && visit.assignedTo !== actor.id) {
@@ -254,7 +234,6 @@ export async function registerVisitRoutes(
     return { visit: serializeVisit(visit) };
   });
 
-  // -------- Patch (form / start) --------------------------------------
   app.patch<{ Params: { id: string } }>("/api/visits/:id", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -264,8 +243,8 @@ export async function registerVisitRoutes(
       return reply.code(400).send({ error: "invalid_visit_patch", issues: parsed.error.issues });
     }
     const visit = await loadVisitForWrite(prisma, request.params.id, actor);
-    if (visit.status === "approved") {
-      return reply.code(409).send({ error: "visit_not_editable" });
+    if (visit.status === "approved" || visit.status === "captured") {
+      return reply.code(409).send({ error: "visit_not_editable", status: visit.status });
     }
 
     const data: Prisma.VisitUpdateManyMutationInput = {};
@@ -287,7 +266,6 @@ export async function registerVisitRoutes(
     return { visit: serializeVisit(updated!) };
   });
 
-  // -------- Evidence upload (multipart) -------------------------------
   app.post<{ Params: { id: string } }>("/api/visits/:id/evidence", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -295,7 +273,7 @@ export async function registerVisitRoutes(
 
     const visit = await loadVisitForWrite(prisma, request.params.id, actor);
     if (visit.status === "approved") {
-      return reply.code(409).send({ error: "visit_not_editable" });
+      return reply.code(409).send({ error: "visit_not_editable", status: visit.status });
     }
 
     const { fields, file } = await readMultipart(request);
@@ -305,9 +283,8 @@ export async function registerVisitRoutes(
     const category = fields.category ? parseField(fields.category, EvidenceCategory, "category") : undefined;
     const label = parseField(fields.label, z.string().min(1).max(200), "label");
     const capturedAt = parseField(fields.capturedAt, z.string().datetime(), "capturedAt");
-    const provenance = fields.provenance ? parseField(JSON.parse(fields.provenance), Provenance, "provenance") : undefined;
+    const provenance = fields.provenance ? parseProvenanceField(fields.provenance) : undefined;
 
-    // Idempotency: if this evidenceId already exists, return it.
     const existing = await prisma.visitEvidence.findUnique({ where: { id: evidenceId } });
     if (existing) {
       if (existing.visitId !== visit.id) {
@@ -321,7 +298,6 @@ export async function registerVisitRoutes(
       return reply.code(415).send({ error: "evidence_type_unsupported" });
     }
 
-    // Per-visit cap
     const count = await prisma.visitEvidence.count({ where: { visitId: visit.id } });
     if (count >= MAX_EVIDENCE_PER_VISIT) {
       return reply.code(413).send({ error: "evidence_limit_reached", limit: MAX_EVIDENCE_PER_VISIT });
@@ -334,12 +310,9 @@ export async function registerVisitRoutes(
       .from(BUCKET)
       .upload(path, file.buffer, { contentType: sniffed.mimeType, upsert: false });
 
-    if (uploadError) {
+    if (uploadError && !/already exists/i.test(uploadError.message)) {
       request.log.error({ err: uploadError, path }, "Supabase storage upload failed");
-      // If the object already exists (retry after a DB failure), that's fine — proceed.
-      if (!/already exists/i.test(uploadError.message)) {
-        return reply.code(502).send({ error: "evidence_upload_failed" });
-      }
+      return reply.code(502).send({ error: "evidence_upload_failed" });
     }
 
     let created;
@@ -363,7 +336,6 @@ export async function registerVisitRoutes(
         },
       });
     } catch (dbError) {
-      // Orphan cleanup: delete the just-uploaded object so retries are clean.
       try {
         await supabaseAdmin.storage.from(BUCKET).remove([path]);
       } catch (cleanupError) {
@@ -376,7 +348,6 @@ export async function registerVisitRoutes(
     return reply.code(201).send({ evidence: serializeEvidence(created) });
   });
 
-  // -------- Evidence read (302 to signed URL) -------------------------
   app.get<{ Params: { id: string; evidenceId: string } }>(
     "/api/visits/:id/evidence/:evidenceId",
     async (request, reply) => {
@@ -400,7 +371,6 @@ export async function registerVisitRoutes(
     },
   );
 
-  // -------- Evidence delete -------------------------------------------
   app.delete<{ Params: { id: string; evidenceId: string } }>(
     "/api/visits/:id/evidence/:evidenceId",
     async (request, reply) => {
@@ -423,7 +393,6 @@ export async function registerVisitRoutes(
     },
   );
 
-  // -------- Submit ----------------------------------------------------
   app.post<{ Params: { id: string } }>("/api/visits/:id/submit", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -437,7 +406,6 @@ export async function registerVisitRoutes(
       return reply.code(409).send({ error: "visit_not_submittable", status: visit.status });
     }
 
-    // Atomic: visit row + grievances in one transaction.
     const result = await prisma.$transaction(async (tx) => {
       const updated = await tx.visit.updateMany({
         where: { id: visit.id, version: parsed.data.version },
@@ -452,7 +420,6 @@ export async function registerVisitRoutes(
       });
       if (updated.count !== 1) throw new Error("visit_conflict");
 
-      // Upsert grievances by client id — idempotent on retry.
       for (const g of parsed.data.grievances) {
         await tx.visitGrievance.upsert({
           where: { id: g.id },
@@ -470,7 +437,7 @@ export async function registerVisitRoutes(
             resolution: g.resolution ?? null,
             resolvedAt: g.resolvedAt ? new Date(g.resolvedAt) : null,
           },
-          update: {}, // never overwrite server-side grievance edits from a stale retry
+          update: {},
         });
       }
 
@@ -501,7 +468,6 @@ export async function registerVisitRoutes(
     return { visit: serializeVisit(result!) };
   });
 
-  // -------- Return ----------------------------------------------------
   app.post<{ Params: { id: string } }>("/api/visits/:id/return", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -532,7 +498,6 @@ export async function registerVisitRoutes(
       });
       if (updated.count !== 1) throw new Error("visit_conflict");
 
-      // Update case readiness — mirrors the current store's returnVisit.
       await tx.caseRecord.update({
         where: { id: visit.caseId },
         data: {
@@ -567,7 +532,6 @@ export async function registerVisitRoutes(
     return { visit: serializeVisit(result!) };
   });
 
-  // -------- Approve ---------------------------------------------------
   app.post<{ Params: { id: string } }>("/api/visits/:id/approve", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
@@ -597,23 +561,13 @@ export async function registerVisitRoutes(
       });
       if (updated.count !== 1) throw new Error("visit_conflict");
 
-      // Mirror the store's approveVisit: readiness depends on latest VerifyNow check.
-      const caseRecord = await tx.caseRecord.findUnique({ where: { id: visit.caseId } });
-      let readiness = "Ready for department";
-      let nextAction = "Prepare department handoff packet";
-      if (caseRecord) {
-        const checks = (caseRecord.verifyNowChecks as unknown[] | null) ?? [];
-        // verifyNowChecks isn't a column yet; this is a placeholder for Slice 2.
-        // For now, approve just unlocks readiness.
-        void checks;
-      }
       await tx.caseRecord.update({
         where: { id: visit.caseId },
         data: {
           verification: "Field review approved",
           verificationTone: "success",
-          readiness,
-          nextAction,
+          readiness: "Ready for department",
+          nextAction: "Prepare department handoff packet",
         },
       });
 
@@ -645,7 +599,7 @@ export async function registerVisitRoutes(
 /* --- Serialization ------------------------------------------------------ */
 
 type VisitWithRelations = Prisma.VisitGetPayload<{
-  include: { evidence: true; grievances: true; case?: true };
+  include: { evidence: true; grievances: true };
 }>;
 
 function serializeVisit(visit: VisitWithRelations) {
@@ -667,15 +621,6 @@ function serializeVisit(visit: VisitWithRelations) {
     version: visit.version,
     evidence: visit.evidence.map(serializeEvidence),
     grievances: visit.grievances.map(serializeGrievance),
-    ...("case" in visit && visit.case ? {
-      case: {
-        id: visit.case.id,
-        name: visit.case.name,
-        household: visit.case.household,
-        project: visit.case.project,
-        location: visit.case.location,
-      },
-    } : {}),
   };
 }
 
@@ -695,7 +640,6 @@ function serializeEvidence(e: {
     provenance: e.provenance,
     legibilityStatus: e.legibilityStatus,
     legibilityNote: e.legibilityNote,
-    // No dataUrl. The client renders via GET /api/visits/:id/evidence/:eid.
   };
 }
 
