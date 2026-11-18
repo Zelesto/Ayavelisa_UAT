@@ -219,6 +219,62 @@ export async function registerVisitRoutes(
     return { visits: visits.map((v) => serializeVisit(v)) };
   });
 
+
+   // Add a new route alongside the visit routes
+app.post("/api/geocode/reverse", async (request, reply) => {
+  const parsed = z.object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+  }).safeParse(request.body);
+
+  if (!parsed.success) {
+    return reply.code(400).send({ error: "invalid_coordinates" });
+  }
+
+  const { lat, lng } = parsed.data;
+  const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2&addressdetails=1&accept-language=en`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        // Nominatim requires a descriptive User-Agent with contact info
+        "User-Agent": "Ayavelisa-HumanSettlements/0.1 (admin@yourdomain.co.za)",
+        "Accept": "application/json",
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      return reply.code(502).send({ error: "geocode_provider_failed" });
+    }
+
+    const data = await response.json() as {
+      display_name?: string;
+      address?: Record<string, string>;
+      lat: string;
+      lon: string;
+    };
+
+    // Extract the fields useful for your app
+    const addr = data.address ?? {};
+    return {
+      formatted: data.display_name ?? null,
+      // These map well to your VisitForm.location fields
+      village: addr.village ?? addr.hamlet ?? addr.suburb ?? addr.town ?? null,
+      ward: addr.city_district ?? addr.suburb ?? addr.county ?? null,
+      municipality: addr.city ?? addr.municipality ?? addr.state ?? null,
+      province: addr.state ?? null,
+      country: addr.country ?? null,
+      postcode: addr.postcode ?? null,
+      raw: data.address ?? null,
+      approximate: true,  // always true for reverse geocode
+    };
+  } catch (error) {
+    request.log.warn({ err: error, lat, lng }, "Reverse geocode failed");
+    return reply.code(502).send({ error: "geocode_unavailable" });
+  }
+});
+   
   app.get<{ Params: { id: string } }>("/api/visits/:id", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
