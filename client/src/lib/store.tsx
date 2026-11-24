@@ -189,6 +189,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const manualSyncInProgress = useRef(false);
   const pendingState = useRef<StoreState | null>(null);
   const lastSavedState = useRef<StoreState | null>(null);
+  const refreshVisitsAfterStateSave = useRef<() => Promise<void>>(async () => undefined);
 
   const setDatabaseStatus = useCallback((status: "loading" | "connected" | "saving" | "error", error: string | null = null) => {
     databaseStatusRef.current = status;
@@ -197,21 +198,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   /* --- /api/state blob ---------------------------------------------------- */
-
-  const refreshStateFromServer = useCallback(async () => {
-    try {
-      const response = await authorizedFetch("/api/state");
-      if (!response.ok) return;
-      const result = await response.json() as { state: StoreState | null; version: number };
-      databaseVersion.current = result.version;
-      if (result.state) {
-        lastSavedState.current = result.state;
-        setState(result.state);
-      }
-    } catch {
-      // Silent — the blob load effect will report errors on its own schedule.
-    }
-  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -273,7 +259,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (!response.ok) throw new Error(`Could not save to the database (${response.status})`);
           const result = await response.json() as { version: number };
           databaseVersion.current = result.version;
+          const previousState = lastSavedState.current;
           lastSavedState.current = snapshot;
+          if (snapshot.visits.some((visit) => !previousState?.visits.some((savedVisit) => savedVisit.id === visit.id))) {
+            void refreshVisitsAfterStateSave.current();
+          }
         }
         if (databaseStatusRef.current === "saving") setDatabaseStatus("connected");
       } catch (error) {
@@ -441,7 +431,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setVisitsError(null);
     try {
       const query = opts?.caseId ? `?caseId=${encodeURIComponent(opts.caseId)}` : "";
-      const result = await api.get<{ visits: any[] }>(`/api/visits${query}`);
+      const result = await api.get<{ visits: any[] }>(`/api/visits${query}${query ? "&" : "?"}limit=200`);
       setVisitsFromApi(result.visits.map((v) => visitFromApi(v)));
       setVisitsLoaded(true);
     } catch (e) {
@@ -450,6 +440,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setVisitsLoading(false);
     }
   }, []);
+  refreshVisitsAfterStateSave.current = refreshVisits;
 
   const refreshPendingQueue = useCallback(async () => {
     const pending = await listPending();
@@ -457,9 +448,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (databaseStatus !== "connected" && databaseStatus !== "saving") return;
     void refreshVisits();
     void refreshPendingQueue();
-  }, [refreshVisits, refreshPendingQueue]);
+  }, [databaseStatus, refreshVisits, refreshPendingQueue]);
 
   /* --- Visits: mutations ------------------------------------------------- */
 
@@ -644,21 +636,56 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [visitsFromApi, isOnline, refreshPendingQueue]);
 
+  const updateCaseAfterVisitReview = useCallback((visit: Visit, status: "returned" | "approved", reason?: string) => {
+    const approved = status === "approved";
+    setState((s) => {
+      if (!s.cases.some((item) => item.id === visit.caseId)) return s;
+      const updatedCase: Partial<CaseRecord> = approved
+        ? {
+            verification: "Field review approved",
+            verificationTone: "success",
+            readiness: "Ready for department",
+            nextAction: "Prepare department handoff packet",
+          }
+        : {
+            verification: "Returned for correction",
+            verificationTone: "warning",
+            readiness: "Review returned",
+            nextAction: "Correct visit and resubmit",
+          };
+      return {
+        ...s,
+        cases: s.cases.map((item) =>
+          item.id === visit.caseId ? { ...item, ...updatedCase, updated: "Just now" } : item,
+        ),
+        activities: [
+          act(
+            "visit",
+            approved ? "sage" : "coral",
+            approved ? "Visit approved" : "Visit returned",
+            approved ? visit.id : `${visit.id} · ${(reason ?? "").slice(0, 60)}`,
+          ),
+          ...s.activities,
+        ].slice(0, 40),
+      };
+    });
+  }, []);
+
   const returnVisit = useCallback(async (id: string, reason: string) => {
     const current = visitsFromApi.find((v) => v.id === id);
     if (!current) throw new ApiError("visit_not_found", 404);
     const result = await api.post<any>(`/api/visits/${id}/return`, { version: versionOf(current), reason });
     setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
-    void refreshStateFromServer();
-  }, [visitsFromApi, refreshStateFromServer]);
+    updateCaseAfterVisitReview(current, "returned", reason);
+  }, [visitsFromApi, updateCaseAfterVisitReview]);
 
   const approveVisit = useCallback(async (id: string) => {
     const current = visitsFromApi.find((v) => v.id === id);
     if (!current) throw new ApiError("visit_not_found", 404);
     const result = await api.post<any>(`/api/visits/${id}/approve`, { version: versionOf(current) });
     setVisitsFromApi((list) => upsertVisitLocal(list, visitFromApi(result.visit)));
-    void refreshStateFromServer();
-  }, [visitsFromApi, refreshStateFromServer]);
+    updateCaseAfterVisitReview(current, "approved");
+  }, [visitsFromApi, updateCaseAfterVisitReview]);
 
   /* --- Offline flusher --------------------------------------------------- */
 
@@ -873,7 +900,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   /* --- Context value ----------------------------------------------------- */
 
   const value = useMemo<Ctx>(() => ({
-    ...state, persona, currentUser, isOnline, isSyncing,
+    ...state, visits: visitsLoaded ? visitsFromApi : state.visits, persona, currentUser, isOnline, isSyncing,
     databaseStatus, databaseError, retryDatabase,
     setPersona, setSeed, resetDemo,
     startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
@@ -883,7 +910,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     visitsFromApi, visitsLoaded, visitsLoading, visitsError,
     pendingQueueCount, refreshVisits, refreshPendingQueue, retryStuckItem,
   }), [
-    state, persona, currentUser, isOnline, isSyncing, databaseStatus, databaseError, retryDatabase,
+    state, visitsFromApi, visitsLoaded, persona, currentUser, isOnline, isSyncing, databaseStatus, databaseError, retryDatabase,
     setPersona, setSeed, resetDemo,
     startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
     createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,

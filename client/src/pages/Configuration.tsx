@@ -27,16 +27,18 @@ export default function Configuration() {
           <p>Programme rules, checklists and roles stay configurable without hiding policy decisions in code.</p>
         </div>
         <div className="heading-actions">
-          <button
-            type="button"
-            className="button button-quiet"
-            onClick={() => {
-              resetDemo();
-              notify("Demo state restored to seed data");
-            }}
-          >
-            Reset demo state
-          </button>
+          {import.meta.env.DEV && !user && (
+            <button
+              type="button"
+              className="button button-quiet"
+              onClick={() => {
+                resetDemo();
+                notify("Demo state restored to seed data");
+              }}
+            >
+              Reset demo state
+            </button>
+          )}
           <button
             type="button"
             className="button button-primary"

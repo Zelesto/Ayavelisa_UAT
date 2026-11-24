@@ -8,7 +8,7 @@
    - Surfaces requestId from the server (for UAT bug reports)
    ========================================================================= */
 
-import { supabase } from "./supabase";
+import { attachDevelopmentPersona, supabase } from "./supabase";
 
 export class ApiError extends Error {
   constructor(
@@ -103,6 +103,7 @@ async function parseError(response: Response): Promise<ApiError> {
 
 async function doFetch(path: string, init: ApiFetchInit, forceRefresh: boolean): Promise<Response> {
   const headers = new Headers(init.headers);
+  attachDevelopmentPersona(headers);
   const token = await getAccessToken(forceRefresh);
   if (token) headers.set("Authorization", `Bearer ${token}`);
 

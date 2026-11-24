@@ -62,6 +62,42 @@ const SaveStateBody = z.object({
   version: z.number().int().nonnegative(),
   state: z.record(z.string(), z.unknown()),
 });
+const WorkspaceCase = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  household: z.string(),
+  project: z.string(),
+  location: z.string(),
+  source: z.string(),
+  verification: z.string(),
+  verificationTone: z.string(),
+  subsidy: z.string(),
+  subsidyTone: z.string(),
+  readiness: z.string(),
+  nextAction: z.string(),
+  updated: z.string(),
+  members: z.number().int(),
+  site: z.string(),
+  sources: z.array(z.record(z.string(), z.unknown())).optional(),
+  intakeId: z.string().nullable().optional(),
+  latestVisitSummary: z.record(z.string(), z.unknown()).nullable().optional(),
+});
+const WorkspaceVisit = z.object({
+  id: z.string().min(1),
+  caseId: z.string().min(1),
+  assignedTo: z.string().min(1),
+  scheduledFor: z.string().datetime(),
+  status: z.enum(["assigned", "in_progress", "captured", "returned", "approved"]),
+  form: z.record(z.string(), z.unknown()).nullable().optional(),
+  summary: z.record(z.string(), z.unknown()).nullable().optional(),
+  startedAt: z.string().datetime().nullable().optional(),
+  submittedAt: z.string().datetime().nullable().optional(),
+  reviewedAt: z.string().datetime().nullable().optional(),
+  returnedAt: z.string().datetime().nullable().optional(),
+  returnReason: z.string().nullable().optional(),
+  reviewedBy: z.string().nullable().optional(),
+  synced: z.boolean().optional(),
+});
 const InviteUserBody = z.object({
   email: z.string().trim().email().max(254),
   name: z.string().trim().min(1).max(120).optional(),
@@ -85,6 +121,106 @@ const editableStateKeys: Record<AccountRole, ReadonlySet<string> | null> = {
   ]),
 };
 
+function localDevelopmentUser(personaHeader: string | string[] | undefined): AuthenticatedUser {
+  const persona = z.enum(["fieldworker", "supervisor", "reviewer"]).catch("fieldworker")
+    .parse(Array.isArray(personaHeader) ? personaHeader[0] : personaHeader);
+  const users = {
+    fieldworker: { id: "Lindiwe Ndlovu", name: "Lindiwe Ndlovu", role: "fieldworker" as const },
+    supervisor: { id: "Thandi Ndlovu", name: "Thandi Ndlovu", role: "supervisor" as const },
+    reviewer: { id: "Sipho Mahlangu", name: "Sipho Mahlangu", role: "reviewer" as const },
+  };
+  return { ...users[persona], email: `${persona}@local.ayavelisa.test` };
+}
+
+async function syncWorkspaceEntities(
+  transaction: Prisma.TransactionClient,
+  state: Record<string, unknown>,
+) {
+  const parsedCases = z.array(WorkspaceCase).safeParse(state.cases ?? []);
+  if (!parsedCases.success) {
+    throw Object.assign(new Error("invalid_workspace_cases"), {
+      statusCode: 400, code: "invalid_workspace_cases", issues: parsedCases.error.issues,
+    });
+  }
+  const parsedVisits = z.array(WorkspaceVisit).safeParse(state.visits ?? []);
+  if (!parsedVisits.success) {
+    throw Object.assign(new Error("invalid_workspace_visits"), {
+      statusCode: 400, code: "invalid_workspace_visits", issues: parsedVisits.error.issues,
+    });
+  }
+
+  const cases = parsedCases.data;
+  const visits = parsedVisits.data;
+  const caseIds = new Set(cases.map((record) => record.id));
+  const existingCases = new Set((await transaction.caseRecord.findMany({
+    where: { id: { in: [...caseIds] } },
+    select: { id: true },
+  })).map((record) => record.id));
+  const newCases = cases.filter((record) => !existingCases.has(record.id));
+
+  if (newCases.length > 0) {
+    await transaction.caseRecord.createMany({
+      skipDuplicates: true,
+      data: newCases.map((record) => ({
+        id: record.id,
+        name: record.name,
+        household: record.household,
+        project: record.project,
+        location: record.location,
+        source: record.source,
+        verification: record.verification,
+        verificationTone: record.verificationTone,
+        subsidy: record.subsidy,
+        subsidyTone: record.subsidyTone,
+        readiness: record.readiness,
+        nextAction: record.nextAction,
+        updated: record.updated,
+        members: record.members,
+        site: record.site,
+        sources: record.sources as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
+        intakeId: record.intakeId ?? null,
+        latestVisitSummary: record.latestVisitSummary as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
+      })),
+    });
+  }
+
+  const knownCaseIds = new Set([...existingCases, ...caseIds]);
+  const invalidVisit = visits.find((record) => !knownCaseIds.has(record.caseId));
+  if (invalidVisit) {
+    throw Object.assign(new Error("visit_case_not_found"), {
+      statusCode: 400, code: "visit_case_not_found", field: invalidVisit.caseId,
+    });
+  }
+  const visitIds = new Set(visits.map((record) => record.id));
+  const existingVisits = new Set((await transaction.visit.findMany({
+    where: { id: { in: [...visitIds] } },
+    select: { id: true },
+  })).map((record) => record.id));
+  const newVisits = visits.filter((record) => !existingVisits.has(record.id));
+
+  if (newVisits.length > 0) {
+    await transaction.visit.createMany({
+      skipDuplicates: true,
+      data: newVisits.map((record) => ({
+        id: record.id,
+        caseId: record.caseId,
+        assignedTo: record.assignedTo,
+        scheduledFor: new Date(record.scheduledFor),
+        status: record.status,
+        form: record.form as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
+        summary: record.summary as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
+        startedAt: record.startedAt ? new Date(record.startedAt) : null,
+        submittedAt: record.submittedAt ? new Date(record.submittedAt) : null,
+        reviewedAt: record.reviewedAt ? new Date(record.reviewedAt) : null,
+        returnedAt: record.returnedAt ? new Date(record.returnedAt) : null,
+        returnReason: record.returnReason ?? null,
+        reviewedBy: record.reviewedBy ?? null,
+        synced: record.synced ?? false,
+      })),
+    });
+  }
+}
+
 await app.register(helmet, { contentSecurityPolicy: false });
 await app.register(multipart, {
   limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 25 },
@@ -95,34 +231,53 @@ await app.register(multipart, {
    attached. Convert it to a stable JSON shape so the client's ApiError can
    parse it. Never leak stack traces in production. */
 app.setErrorHandler((error, request, reply) => {
+  const routeError: Error & {
+    statusCode?: number;
+    status?: number;
+    code?: string;
+    issues?: unknown;
+    field?: unknown;
+    sections?: unknown;
+    limit?: number;
+  } = error instanceof Error
+    ? error as Error & {
+        statusCode?: number;
+        status?: number;
+        code?: string;
+        issues?: unknown;
+        field?: unknown;
+        sections?: unknown;
+        limit?: number;
+      }
+    : new Error(String(error));
   const statusCode =
-    (typeof (error as { statusCode?: number }).statusCode === "number"
-      ? (error as { statusCode: number }).statusCode
-      : undefined) ?? (error as { status?: number }).status ?? 500;
+    (typeof routeError.statusCode === "number" ? routeError.statusCode : undefined)
+    ?? routeError.status
+    ?? 500;
 
   const code =
-    (error as { code?: string }).code ??
-    (statusCode === 500 ? "internal_error" : error.name ?? "error");
+    routeError.code ??
+    (statusCode === 500 ? "internal_error" : routeError.name ?? "error");
 
   if (statusCode >= 500) {
-    request.log.error({ err: error, code, requestId: request.id }, "Unhandled route error");
+    request.log.error({ err: routeError, code, requestId: request.id }, "Unhandled route error");
   } else {
-    request.log.warn({ err: error.message, code, requestId: request.id }, "Handled route error");
+    request.log.warn({ err: routeError.message, code, requestId: request.id }, "Handled route error");
   }
 
   const body: Record<string, unknown> = { error: code, requestId: request.id };
-  const issues = (error as { issues?: unknown }).issues;
+  const issues = routeError.issues;
   if (issues) body.issues = issues;
-  const field = (error as { field?: unknown }).field;
+  const field = routeError.field;
   if (field) body.field = field;
-  const sections = (error as { sections?: unknown }).sections;
+  const sections = routeError.sections;
   if (sections) body.sections = sections;
-  const limit = (error as { limit?: unknown }).limit;
+  const limit = routeError.limit;
   if (limit !== undefined) body.limit = limit;
 
   // Never send the raw message for 5xx.
-  if (statusCode < 500 && error.message && error.message !== code) {
-    body.message = error.message;
+  if (statusCode < 500 && routeError.message && routeError.message !== code) {
+    body.message = routeError.message;
   }
 
   return reply.code(statusCode).send(body);
@@ -133,8 +288,10 @@ app.addHook("preHandler", async (request, reply) => {
   const route = request.url.split("?")[0];
   if (!route.startsWith("/api/") || route === "/api/health") return;
   if (!supabase) {
-    if (process.env.NODE_ENV !== "production" && process.env.ALLOW_DEV_AUTH_BYPASS === "true") return;
-    if (process.env.NODE_ENV !== "production") return;
+    if (process.env.NODE_ENV !== "production") {
+      request.authUser = localDevelopmentUser(request.headers["x-dev-persona"]);
+      return;
+    }
     return reply.code(503).send({ error: "authentication_unavailable" });
   }
 
@@ -554,6 +711,9 @@ app.get("/api/state", async (_request, reply) => {
   reply.header("Cache-Control", "no-store");
   const saved = await prisma.appState.findUnique({ where: { id: STATE_ID } });
   if (!saved) return { state: null, version: 0 };
+  await prisma.$transaction((transaction) =>
+    syncWorkspaceEntities(transaction, saved.data as Record<string, unknown>),
+  );
   return { state: saved.data, version: saved.version };
 });
 
@@ -565,7 +725,8 @@ app.put("/api/state", async (request, reply) => {
   }
 
   const current = await prisma.appState.findUnique({ where: { id: STATE_ID } });
-  const role = request.authUser?.role;
+  const isLocalDemoUser = request.authUser?.email.endsWith("@local.ayavelisa.test") ?? false;
+  const role = isLocalDemoUser ? undefined : request.authUser?.role;
   if (role && !current && role !== "admin" && role !== "supervisor") {
     return reply.code(403).send({ error: "workspace_initialization_requires_supervisor" });
   }
@@ -589,8 +750,12 @@ app.put("/api/state", async (request, reply) => {
 
   if (!current) {
     try {
-      const created = await prisma.appState.create({
-        data: { id: STATE_ID, data: parsed.data.state as Prisma.InputJsonValue, version: 1 },
+      const created = await prisma.$transaction(async (transaction) => {
+        const saved = await transaction.appState.create({
+          data: { id: STATE_ID, data: parsed.data.state as Prisma.InputJsonValue, version: 1 },
+        });
+        await syncWorkspaceEntities(transaction, parsed.data.state);
+        return saved;
       });
       return { version: created.version };
     } catch (error) {
@@ -602,18 +767,23 @@ app.put("/api/state", async (request, reply) => {
     }
   }
 
-  const updated = await prisma.appState.updateMany({
-    where: { id: STATE_ID, version: parsed.data.version },
-    data: {
-      data: parsed.data.state as Prisma.InputJsonValue,
-      version: { increment: 1 },
-    },
+  const updatedVersion = await prisma.$transaction(async (transaction) => {
+    const updated = await transaction.appState.updateMany({
+      where: { id: STATE_ID, version: parsed.data.version },
+      data: {
+        data: parsed.data.state as Prisma.InputJsonValue,
+        version: { increment: 1 },
+      },
+    });
+    if (updated.count !== 1) return null;
+    await syncWorkspaceEntities(transaction, parsed.data.state);
+    return parsed.data.version + 1;
   });
-  if (updated.count !== 1) {
+  if (updatedVersion === null) {
     const latest = await prisma.appState.findUnique({ where: { id: STATE_ID } });
     return reply.code(409).send({ error: "state_conflict", version: latest?.version ?? 0 });
   }
-  return { version: parsed.data.version + 1 };
+  return { version: updatedVersion };
 });
 
 if (process.env.NODE_ENV === "production") {
@@ -630,7 +800,7 @@ if (process.env.NODE_ENV === "production") {
 }
 
 const port = Number(process.env.PORT ?? 4000);
-await app.listen({ port, host: "0.0.0.0" });
+await app.listen({ port, host: process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1" });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {

@@ -9,10 +9,13 @@ import type { PrismaClient, Prisma } from "@prisma/client";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import crypto from "node:crypto";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import path from "node:path";
 
 const BUCKET = "visit-evidence";
 const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
 const MAX_EVIDENCE_PER_VISIT = 25;
+const LOCAL_EVIDENCE_DIRECTORY = path.resolve(process.env.LOCAL_EVIDENCE_DIRECTORY ?? "uploads/visit-evidence");
 
 /* --- Validation --------------------------------------------------------- */
 
@@ -77,6 +80,25 @@ const ApproveVisitBody = z.object({
 
 function sha256(buf: Buffer): string {
   return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function safeStorageSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "_") || "unknown";
+}
+
+function localEvidenceFile(storagePath: string): string {
+  const segments = storagePath.split("/");
+  if (segments.length < 2 || segments.some((segment) => !/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9]+)?$/.test(segment))) {
+    throw Object.assign(new Error("invalid_evidence_storage_path"), {
+      statusCode: 500, code: "invalid_evidence_storage_path",
+    });
+  }
+  return path.join(LOCAL_EVIDENCE_DIRECTORY, ...segments);
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
 }
 
 function sniffImageOrPdf(buf: Buffer): { mimeType: string; ext: string } | null {
@@ -150,7 +172,7 @@ async function readMultipart(request: FastifyRequest): Promise<{
 async function loadVisitForWrite(
   prisma: PrismaClient,
   visitId: string,
-  actor: { id: string; role: string },
+  actor: { id: string; name: string; role: string },
 ) {
   const visit = await prisma.visit.findUnique({
     where: { id: visitId },
@@ -159,7 +181,7 @@ async function loadVisitForWrite(
   if (!visit) {
     throw Object.assign(new Error("visit_not_found"), { statusCode: 404, code: "visit_not_found" });
   }
-  if (actor.role === "fieldworker" && visit.assignedTo !== actor.id) {
+  if (actor.role === "fieldworker" && visit.assignedTo !== actor.id && visit.assignedTo !== actor.name) {
     throw Object.assign(new Error("visit_forbidden"), { statusCode: 403, code: "visit_forbidden" });
   }
   return visit;
@@ -271,7 +293,7 @@ export async function registerVisitRoutes(
       if (query.from) where.scheduledFor.gte = new Date(query.from);
       if (query.to) where.scheduledFor.lte = new Date(query.to);
     }
-    if (actor.role === "fieldworker") where.assignedTo = actor.id;
+    if (actor.role === "fieldworker") where.assignedTo = { in: [actor.id, actor.name] };
     else if (query.assignedTo) where.assignedTo = query.assignedTo;
 
     const visits = await prisma.visit.findMany({
@@ -293,7 +315,7 @@ export async function registerVisitRoutes(
       include: { evidence: true, grievances: true },
     });
     if (!visit) return reply.code(404).send({ error: "visit_not_found" });
-    if (actor.role === "fieldworker" && visit.assignedTo !== actor.id) {
+    if (actor.role === "fieldworker" && visit.assignedTo !== actor.id && visit.assignedTo !== actor.name) {
       return reply.code(403).send({ error: "visit_forbidden" });
     }
     return { visit: serializeVisit(visit) };
@@ -336,7 +358,9 @@ export async function registerVisitRoutes(
   app.post<{ Params: { id: string } }>("/api/visits/:id/evidence", async (request, reply) => {
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
-    if (!supabaseAdmin) return reply.code(503).send({ error: "evidence_storage_unavailable" });
+    if (!supabaseAdmin && process.env.NODE_ENV === "production") {
+      return reply.code(503).send({ error: "evidence_storage_unavailable" });
+    }
 
     const visit = await loadVisitForWrite(prisma, request.params.id, actor);
     if (visit.status === "approved") {
@@ -371,15 +395,39 @@ export async function registerVisitRoutes(
     }
 
     const hash = sha256(file.buffer);
-    const path = `${visit.case.project.replace(/[^A-Za-z0-9_-]/g, "_")}/${visit.caseId}/${visit.id}/${evidenceId}.${sniffed.ext}`;
+    const storagePath = [
+      visit.case.project,
+      visit.caseId,
+      visit.id,
+      `${evidenceId}.${sniffed.ext}`,
+    ].map((segment) => safeStorageSegment(segment)).join("/");
+    let localFilePath: string | null = null;
+    let localFileCreated = false;
 
-    const { error: uploadError } = await supabaseAdmin.storage
-      .from(BUCKET)
-      .upload(path, file.buffer, { contentType: sniffed.mimeType, upsert: false });
-
-    if (uploadError && !/already exists/i.test(uploadError.message)) {
-      request.log.error({ err: uploadError, path }, "Supabase storage upload failed");
-      return reply.code(502).send({ error: "evidence_upload_failed" });
+    if (supabaseAdmin) {
+      const { error: uploadError } = await supabaseAdmin.storage
+        .from(BUCKET)
+        .upload(storagePath, file.buffer, { contentType: sniffed.mimeType, upsert: false });
+      if (uploadError && !/already exists/i.test(uploadError.message)) {
+        request.log.error({ err: uploadError, path: storagePath }, "Supabase storage upload failed");
+        return reply.code(502).send({ error: "evidence_upload_failed" });
+      }
+    } else {
+      localFilePath = localEvidenceFile(storagePath);
+      try {
+        await mkdir(path.dirname(localFilePath), { recursive: true });
+        await writeFile(localFilePath, file.buffer, { flag: "wx" });
+        localFileCreated = true;
+      } catch (storageError) {
+        if (errorCode(storageError) !== "EEXIST") {
+          request.log.error({ err: storageError, path: storagePath }, "Local evidence write failed");
+          return reply.code(502).send({ error: "evidence_upload_failed" });
+        }
+        const existingBuffer = await readFile(localFilePath);
+        if (sha256(existingBuffer) !== hash) {
+          return reply.code(409).send({ error: "evidence_id_in_use" });
+        }
+      }
     }
 
     let created;
@@ -391,7 +439,7 @@ export async function registerVisitRoutes(
           kind,
           category: category ?? null,
           label,
-          storagePath: path,
+          storagePath,
           mimeType: sniffed.mimeType,
           sizeBytes: file.buffer.length,
           capturedAt: new Date(capturedAt),
@@ -403,10 +451,15 @@ export async function registerVisitRoutes(
         },
       });
     } catch (dbError) {
-      try {
-        await supabaseAdmin.storage.from(BUCKET).remove([path]);
-      } catch (cleanupError) {
-        request.log.error({ err: cleanupError, path }, "Could not remove orphaned evidence object");
+      if (supabaseAdmin) {
+        const { error: cleanupError } = await supabaseAdmin.storage.from(BUCKET).remove([storagePath]);
+        if (cleanupError) request.log.error({ err: cleanupError, path: storagePath }, "Could not remove orphaned evidence object");
+      } else if (localFileCreated && localFilePath) {
+        try {
+          await unlink(localFilePath);
+        } catch (cleanupError) {
+          request.log.error({ err: cleanupError, path: storagePath }, "Could not remove orphaned evidence file");
+        }
       }
       request.log.error({ err: dbError, evidenceId }, "Evidence DB insert failed");
       return reply.code(502).send({ error: "evidence_save_failed" });
@@ -421,12 +474,40 @@ export async function registerVisitRoutes(
     async (request, reply) => {
       const actor = request.authUser;
       if (!actor) return reply.code(401).send({ error: "unauthorized" });
-      if (!supabaseAdmin) return reply.code(503).send({ error: "evidence_storage_unavailable" });
 
       const evidence = await prisma.visitEvidence.findFirst({
         where: { id: request.params.evidenceId, visitId: request.params.id },
       });
       if (!evidence) return reply.code(404).send({ error: "evidence_not_found" });
+
+      if (evidence.storagePath.startsWith("legacy:")) {
+        const match = evidence.dataUrl?.match(/^data:[^;,]+;base64,([\s\S]*)$/);
+        if (!match) return reply.code(410).send({ error: "legacy_evidence_unavailable" });
+        const buffer = Buffer.from(match[1], "base64");
+        if (buffer.length === 0) return reply.code(410).send({ error: "legacy_evidence_unavailable" });
+        return reply
+          .header("Cache-Control", "private, no-store")
+          .type(evidence.mimeType)
+          .send(buffer);
+      }
+      if (!supabaseAdmin) {
+        if (process.env.NODE_ENV === "production") {
+          return reply.code(503).send({ error: "evidence_storage_unavailable" });
+        }
+        const filePath = localEvidenceFile(evidence.storagePath);
+        try {
+          const buffer = await readFile(filePath);
+          return reply
+            .header("Cache-Control", "private, no-store")
+            .type(evidence.mimeType)
+            .send(buffer);
+        } catch (storageError) {
+          if (errorCode(storageError) === "ENOENT") {
+            return reply.code(410).send({ error: "evidence_file_missing" });
+          }
+          throw storageError;
+        }
+      }
 
       const { data, error } = await supabaseAdmin.storage
         .from(BUCKET)
@@ -454,9 +535,17 @@ export async function registerVisitRoutes(
       if (!evidence) return reply.code(404).send({ error: "evidence_not_found" });
 
       await prisma.visitEvidence.delete({ where: { id: evidence.id } });
-      if (supabaseAdmin) {
+      if (supabaseAdmin && !evidence.storagePath.startsWith("legacy:")) {
         const { error } = await supabaseAdmin.storage.from(BUCKET).remove([evidence.storagePath]);
         if (error) request.log.warn({ err: error, path: evidence.storagePath }, "Storage delete failed; orphan remains");
+      } else if (!supabaseAdmin && !evidence.storagePath.startsWith("legacy:")) {
+        try {
+          await unlink(localEvidenceFile(evidence.storagePath));
+        } catch (storageError) {
+          if (errorCode(storageError) !== "ENOENT") {
+            request.log.warn({ err: storageError, path: evidence.storagePath }, "Local evidence delete failed; orphan remains");
+          }
+        }
       }
       return reply.code(204).send();
     },

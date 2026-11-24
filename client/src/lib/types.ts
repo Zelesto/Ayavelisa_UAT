@@ -38,23 +38,6 @@ export type GpsCapture = {
   source: "device" | "manual" | "unavailable";
 };
 
-export type VisitForm = {
-  // ... existing fields ...
-
-  /** Approximate address returned by server-side reverse geocode. */
-  locationReverseGeocode?: {
-    formatted: string | null;
-    village: string | null;
-    ward: string | null;
-    municipality: string | null;
-    province: string | null;
-    approximate: boolean;
-    fetchedAt: string;
-  } | null;
-
-  // ... rest unchanged ...
-};
-
 export type VisitEvidenceCategory =
   | "identity"
   | "proof_of_residence"
@@ -80,7 +63,8 @@ export type Evidence = {
   kind: "photo" | "signature" | "document";
   category?: VisitEvidenceCategory;
   label: string;
-  dataUrl: string;
+  dataUrl?: string;
+  mimeType?: string;
   capturedAt: string;
   sizeBytes: number;
   provenance?: EvidenceProvenance;
@@ -176,6 +160,16 @@ export type VisitForm = {
   municipalityObserved: string;
   locationSource: CheckSource;
   locationDiscrepancyNote: string;
+  /** Approximate address returned by server-side reverse geocode. */
+  locationReverseGeocode?: {
+    formatted: string | null;
+    village: string | null;
+    ward: string | null;
+    municipality: string | null;
+    province: string | null;
+    approximate: boolean;
+    fetchedAt: string;
+  } | null;
 
   // Identity
   identityType: string;

@@ -7,8 +7,26 @@ export const supabase = supabaseUrl && supabaseAnonKey
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
 
+export function attachDevelopmentPersona(headers: Headers) {
+  if (!import.meta.env.DEV || supabase) return;
+  const rawState = window.localStorage.getItem("ayavelisa:field:v2");
+  let persona = "fieldworker";
+  if (rawState) {
+    try {
+      const savedPersona = (JSON.parse(rawState) as { persona?: unknown }).persona;
+      if (savedPersona === "fieldworker" || savedPersona === "supervisor" || savedPersona === "reviewer") {
+        persona = savedPersona;
+      }
+    } catch {
+      // Keep local demo requests on the least-privileged persona.
+    }
+  }
+  headers.set("X-Dev-Persona", persona);
+}
+
 export async function authorizedFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
+  attachDevelopmentPersona(headers);
   if (supabase) {
     const { data, error } = await supabase.auth.getSession();
     if (error) throw error;

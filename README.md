@@ -2,12 +2,10 @@
 
 ## Run locally
 
-1. Copy `.env.example` to `.env` and set `DATABASE_URL`, `DIRECT_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_BOOTSTRAP_ADMIN_EMAILS`, and the matching `VITE_SUPABASE_*` values.
-2. For local-only development without Supabase, leave the Supabase variables unset; the development UI uses demo data and the API remains unauthenticated on localhost.
-3. If using a Supabase project, create the initial administrator in Supabase Auth and add its email to `SUPABASE_BOOTSTRAP_ADMIN_EMAILS`.
-4. Install packages: `pnpm install`
-5. Start the API and web app: `pnpm dev`
-6. Open `http://localhost:3000`.
+1. Copy `.env.example` to `.env`. For local PostgreSQL, set `DATABASE_URL` and `DIRECT_URL` to `postgresql://ayavelisa:ayavelisa_dev@localhost:5433/ayavelisa?schema=public`.
+2. For local-only development without Supabase, leave the Supabase variables unset. Start the local database with `docker compose up -d postgres`, install packages with `pnpm install`, then run `pnpm dev`. The development API binds to localhost, uses the selected local persona, and stores evidence files under the ignored `uploads/` directory; this mode is for development only.
+3. For Supabase-backed development, set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_BOOTSTRAP_ADMIN_EMAILS`, and the matching `VITE_SUPABASE_*` values. Create the initial administrator in Supabase Auth and create a private Storage bucket named `visit-evidence`.
+4. Open `http://localhost:3000`.
 
 Vite proxies `/api` requests to the API on port 4000. For Supabase, use the transaction-pooler URI (port 6543) for `DATABASE_URL` at runtime and the session-pooler URI (port 5432) for `DIRECT_URL`, which Prisma uses for migrations. Both values are private.
 
@@ -23,9 +21,9 @@ The script does not discard local changes. If a rebase conflict occurs, resolve 
 
 ## Run the full app with Docker
 
-Run `docker compose up --build`, then open `http://localhost:3000`. The app waits for PostgreSQL, applies the schema, and serves the web UI and API together. PostgreSQL data is kept in the `pgdata` Docker volume.
+Configure all Supabase variables listed above in `.env`, create the private `visit-evidence` Storage bucket, then run `docker compose up --build` and open `http://localhost:3000`. The app waits for PostgreSQL, applies the schema, and serves the web UI and API together. PostgreSQL data is kept in the `pgdata` Docker volume. The browser Supabase URL and publishable key are embedded at image build time; rebuild after changing them.
 
-The app's current screens share one persisted workspace document in PostgreSQL. Writes use a version check to detect concurrent changes; when a conflict is reported, reload the page to load the latest shared data before continuing. Browser storage remains a local cache and is not the shared source of truth.
+The app's current screens share one persisted workspace document in PostgreSQL. Cases and scheduled visits are also provisioned into their relational tables so the visit capture, evidence, and review APIs operate on the same records. Writes use a version check to detect concurrent changes; when a conflict is reported, reload the page to load the latest shared data before continuing. Browser storage remains a local cache and is not the shared source of truth.
 
 ## Protected demo deployment
 

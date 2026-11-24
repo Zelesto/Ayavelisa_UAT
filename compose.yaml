@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ayavelisa_dev}
       POSTGRES_DB: ayavelisa
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,11 +20,19 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
     restart: unless-stopped
     environment:
       NODE_ENV: production
       PORT: 3000
       DATABASE_URL: postgresql://ayavelisa:${POSTGRES_PASSWORD:-ayavelisa_dev}@postgres:5432/ayavelisa?schema=public
+      DIRECT_URL: postgresql://ayavelisa:${POSTGRES_PASSWORD:-ayavelisa_dev}@postgres:5432/ayavelisa?schema=public
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      SUPABASE_BOOTSTRAP_ADMIN_EMAILS: ${SUPABASE_BOOTSTRAP_ADMIN_EMAILS:-}
     ports:
       - "3000:3000"
     depends_on:

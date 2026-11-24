@@ -10,6 +10,7 @@ import { captureGps, formatCoord } from "@/lib/geo";
 import { reverseGeocode, applyGeocodeToForm } from "@/lib/geocode";
 import { compressImage, formatBytes } from "@/lib/photo";
 import { evidenceUrl, ApiError } from "@/lib/api";
+import { authorizedFetch } from "@/lib/supabase";
 import { useVisitDraft } from "@/lib/useVisitDraft";
 import type {
   AcknowledgementMode, CheckSource, Grievance, HouseholdRelationship, PreferredLanguage,
@@ -1573,7 +1574,7 @@ function EvidenceGrid({
       {ev.map((e) => (
         <div className="evidence-card" key={e.id}>
           {e.kind === "photo" || e.kind === "signature" ? (
-            <img src={evidenceUrl(visitId, e.id)} alt={e.label} />
+            <EvidenceImage visitId={visitId} evidenceId={e.id} label={e.label} />
           ) : (
             <div className="evidence-placeholder">{e.label}</div>
           )}
@@ -1602,4 +1603,41 @@ function EvidenceGrid({
       ))}
     </div>
   );
+}
+
+function EvidenceImage({ visitId, evidenceId, label }: { visitId: string; evidenceId: string; label: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    let objectUrl: string | null = null;
+    void authorizedFetch(evidenceUrl(visitId, evidenceId), { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Evidence request failed (${response.status})`);
+        const blob = await response.blob();
+        if (!blob.type.startsWith("image/")) throw new Error("The evidence file is not an image");
+        objectUrl = URL.createObjectURL(blob);
+        if (active) setSrc(objectUrl);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        const message = error instanceof Error ? error.message : "Could not load evidence";
+        console.error("Could not load visit evidence", error);
+        if (active) setLoadError(message);
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [visitId, evidenceId]);
+
+  if (loadError) {
+    return <div className="evidence-placeholder" role="img" aria-label={`${label}: ${loadError}`}>Image unavailable</div>;
+  }
+  if (!src) return <div className="evidence-placeholder" role="status">Loading image…</div>;
+  return <img src={src} alt={label} />;
 }

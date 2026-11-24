@@ -95,6 +95,7 @@ model VisitEvidence {
   kind             String
   category         String?
   label            String
+  dataUrl          String?
   storagePath      String
   mimeType         String
   sizeBytes        Int
