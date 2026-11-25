@@ -1,16 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, ArrowUpRight, LockKeyhole, Plus, Search, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowRight, ArrowUpRight, FileSpreadsheet, LockKeyhole, Plus, Search, X } from "lucide-react";
 import { navigate, useSearchParams } from "@/lib/router";
 import { useStore } from "@/lib/store";
 import { SectionEyebrow, StatusPill, cx, useToast } from "@/components/ui";
 import { exportCases, type ExportFormat } from "@/lib/caseExport";
 import type { CaseRecord } from "@/lib/types";
+import { api } from "@/lib/api";
+import { useAuth } from "@/components/AuthGate";
 
 type CaseDraft = Pick<CaseRecord, "name" | "household" | "project" | "location" | "source" | "members" | "site">;
 const EMPTY_CASE: CaseDraft = { name: "", household: "", project: "", location: "", source: "", members: 1, site: "Unallocated" };
 
 export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
-  const { cases, createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks } = useStore();
+  const { cases, createCase, createCases, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, activeBranchId, databaseStatus } = useStore();
+  const { user } = useAuth();
   const { notify } = useToast();
   const params = useSearchParams();
   const filterParam = params.get("filter") ?? "All cases";
@@ -18,7 +21,34 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
   const [query, setQuery] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [editor, setEditor] = useState<{ id: string | null; draft: CaseDraft } | null>(null);
-  const [assignee, setAssignee] = useState("Thandi Ndlovu");
+  const [workers, setWorkers] = useState<Array<{ id: string; name: string; email: string }>>([]);
+  const [workersError, setWorkersError] = useState("");
+  const [assigneeId, setAssigneeId] = useState("");
+  const [scheduledDate, setScheduledDate] = useState(() => {
+    const now = new Date();
+    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+    return now.toISOString().slice(0, 10);
+  });
+  const [assigning, setAssigning] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const canAssign = user?.role === "admin" || user?.role === "supervisor";
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    setWorkersError("");
+    api.get<{ workers: Array<{ id: string; name: string; email: string }> }>("/api/branches/workers")
+      .then(({ workers: available }) => {
+        if (!active) return;
+        setWorkers(available);
+        setAssigneeId((current) => available.some((worker) => worker.id === current) ? current : available[0]?.id ?? "");
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setWorkersError(error instanceof Error ? error.message : "Could not load branch fieldworkers.");
+      });
+    return () => { active = false; };
+  }, [activeBranchId]);
 
   useEffect(() => {
     setFilter(filterParam);
@@ -75,10 +105,69 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
     notify(`Recorded ${results.length} VerifyNow request(s). The provider API is not configured; no external checks were performed.`, "error");
   };
   const runBulkAssign = () => {
-    if (!selectedCases.length) return;
-    assignCases(selectedCases.map((item) => item.id), assignee);
-    setSelectedIds([]);
-    notify(`Assigned ${selectedCases.length} case(s) to ${assignee}`);
+    const worker = workers.find((item) => item.id === assigneeId);
+    if (!selectedCases.length || !worker || !scheduledDate) return;
+    const schedule = new Date(`${scheduledDate}T09:00:00`);
+    setAssigning(true);
+    assignCases(selectedCases.map((item) => item.id), worker, schedule.toISOString())
+      .then(() => {
+        setSelectedIds([]);
+        notify(`Assigned ${selectedCases.length} case(s) to ${worker.name} and scheduled visits`);
+      })
+      .catch((error: unknown) => notify(error instanceof Error ? error.message : "Could not assign cases", "error"))
+      .finally(() => setAssigning(false));
+  };
+
+  const importCases = async (file: File) => {
+    setImporting(true);
+    try {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: false });
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+      if (!firstSheet) throw new Error("The selected workbook has no sheets.");
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: "" });
+      if (rows.length === 0) throw new Error("The selected sheet has no data rows.");
+      const drafts: CaseDraft[] = [];
+      let rejected = 0;
+      const get = (row: Record<string, unknown>, names: string[]) => {
+        const normalized = new Map(Object.entries(row).map(([key, value]) => [
+          key.toLowerCase().replace(/[^a-z0-9]/g, ""),
+          String(value ?? "").trim(),
+        ]));
+        for (const name of names) {
+          const value = normalized.get(name.replace(/[^a-z0-9]/gi, "").toLowerCase());
+          if (value) return value;
+        }
+        return "";
+      };
+      for (const row of rows) {
+        const name = get(row, ["applicant name", "beneficiary name", "full name", "name"]);
+        const project = get(row, ["project", "project name"]);
+        const location = get(row, ["location", "ward", "area", "township"]);
+        if (!name || !project || !location) {
+          rejected += 1;
+          continue;
+        }
+        const parsedMembers = Number(get(row, ["household members", "members", "household size"]));
+        drafts.push({
+          name,
+          household: get(row, ["household", "household name"]) || `${name} household`,
+          project,
+          location,
+          source: get(row, ["source", "source list", "programme"]) || file.name,
+          members: Number.isInteger(parsedMembers) && parsedMembers > 0 ? parsedMembers : 1,
+          site: get(row, ["site", "plot", "site number"]) || "Unallocated",
+        });
+      }
+      if (!drafts.length) throw new Error("No valid rows found. Required columns: applicant name, project, and location (or ward/area).");
+      const imported = createCases(drafts);
+      notify(`Imported ${imported} case(s)${rejected ? `; skipped ${rejected} row(s) missing required fields` : ""}`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Could not import cases", "error");
+    } finally {
+      setImporting(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
   };
 
   return (
@@ -90,6 +179,20 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
           <p>One controlled record across intake, verification, subsidy, site and dwelling.</p>
         </div>
         <div className="heading-actions">
+          <input
+            ref={fileInput}
+            className="sr-only"
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            aria-label="Import case spreadsheet"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void importCases(file);
+            }}
+          />
+          <button className="button button-outline" type="button" disabled={importing} onClick={() => fileInput.current?.click()}>
+            <FileSpreadsheet size={16} />{importing ? "Importing…" : "Import file"}
+          </button>
           <button className="button button-quiet" type="button" onClick={onNewIntake}>
             <Plus size={17} /> New intake
           </button>
@@ -151,10 +254,18 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
           <div className="bulk-toolbar" aria-label="Bulk case actions">
             <strong>{selectedCases.length} selected</strong>
             <button type="button" className="button button-outline" onClick={runBulkVerify}>Run VerifyNow</button>
-            <select value={assignee} onChange={(event) => setAssignee(event.target.value)} aria-label="Assign selected cases to">
-              <option>Lindiwe Ndlovu</option><option>Thandi Ndlovu</option><option>Sipho Mahlangu</option>
-            </select>
-            <button type="button" className="button button-outline" onClick={runBulkAssign}>Assign</button>
+            {canAssign && (
+              <>
+                <select value={assigneeId} onChange={(event) => setAssigneeId(event.target.value)} aria-label="Assign selected cases to" disabled={workers.length === 0}>
+                  {workers.length === 0 && <option value="">{workersError ? "Fieldworkers unavailable" : "No fieldworkers in branch"}</option>}
+                  {workers.map((worker) => <option key={worker.id} value={worker.id}>{worker.name}</option>)}
+                </select>
+                <input type="date" value={scheduledDate} onChange={(event) => setScheduledDate(event.target.value)} aria-label="Visit date" />
+                <button type="button" className="button button-outline" onClick={runBulkAssign} disabled={assigning || !workers.length || !scheduledDate || databaseStatus !== "connected"}>
+                  {assigning ? "Assigning…" : databaseStatus !== "connected" ? "Saving cases…" : "Assign & schedule"}
+                </button>
+              </>
+            )}
             <button type="button" className="button button-outline" onClick={() => void exportSelection("xlsx", selectedCases)}>Excel</button>
             <button type="button" className="button button-outline" onClick={() => void exportSelection("pdf", selectedCases)}>PDF</button>
             <button type="button" className="button button-outline" onClick={() => void exportSelection("csv", selectedCases)}>CSV</button>
@@ -180,6 +291,7 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
                 <th><input type="checkbox" aria-label="Select all visible cases" checked={filtered.length > 0 && filtered.every((item) => selectedIds.includes(item.id))} onChange={toggleAll} /></th>
                 <th>Case / household</th>
                 <th>Project &amp; place</th>
+                <th>Assigned fieldworker</th>
                 <th>Verification</th>
                 <th>Subsidy status</th>
                 <th>Readiness</th>
@@ -229,6 +341,7 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
                       <span>{item.location}</span>
                     </div>
                   </td>
+                  <td>{item.assignedTo ?? "Unassigned"}</td>
                   <td>
                     <StatusPill label={item.verification} tone={item.verificationTone} />
                   </td>
@@ -269,7 +382,7 @@ export default function Cases({ onNewIntake }: { onNewIntake: () => void }) {
               ))}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={8} style={{ textAlign: "center", color: "var(--muted)", padding: "28px" }}>
+                  <td colSpan={9} style={{ textAlign: "center", color: "var(--muted)", padding: "28px" }}>
                     No cases match the current search or filter.
                   </td>
                 </tr>

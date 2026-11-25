@@ -1,11 +1,13 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, FileSpreadsheet,
+  AlertTriangle, CheckCircle2, Clock3, FileSpreadsheet,
   MapPin, Search, Users,
 } from "lucide-react";
 import { useStore } from "@/lib/store";
 import type { BeneficiaryLead, LeadStatus } from "@/lib/types";
 import { SectionEyebrow, useToast } from "@/components/ui";
+import { useAuth } from "@/components/AuthGate";
+import { api } from "@/lib/api";
 
 const LEAD_STATUSES: LeadStatus[] = [
   "New",
@@ -43,14 +45,35 @@ function displayName(lead: BeneficiaryLead) {
 }
 
 export default function LeadManagement() {
-  const { leadImportBatches, beneficiaryLeads } = useStore();
+  const { leadImportBatches, beneficiaryLeads, assignLeads, importLeads, activeBranchId, currentUser } = useStore();
+  const { user } = useAuth();
   const { notify } = useToast();
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<LeadStatus | "All">("All");
+  const [workers, setWorkers] = useState<Array<{ id: string; name: string; email: string }>>([]);
+  const [workersError, setWorkersError] = useState("");
+  const [duplicatesOnly, setDuplicatesOnly] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const canAssign = user?.role === "admin" || user?.role === "supervisor";
+  const isFieldworker = user?.role === "fieldworker";
+
+  useEffect(() => {
+    if (!canAssign) return;
+    let active = true;
+    api.get<{ workers: Array<{ id: string; name: string; email: string }> }>("/api/branches/workers")
+      .then(({ workers: available }) => { if (active) setWorkers(available); })
+      .catch((error: unknown) => {
+        if (active) setWorkersError(error instanceof Error ? error.message : "Could not load branch fieldworkers.");
+      });
+    return () => { active = false; };
+  }, [activeBranchId, canAssign]);
 
   const filteredLeads = useMemo(() => {
     const search = query.trim().toLowerCase();
     return beneficiaryLeads.filter((lead) => {
+      if (isFieldworker && lead.assignedTo !== user?.id && lead.assignedTo !== user?.name) return false;
+      if (duplicatesOnly && !lead.duplicateFlag) return false;
       const matchesSearch = !search || [
         lead.fullNames,
         lead.surname,
@@ -62,13 +85,63 @@ export default function LeadManagement() {
       ].some((value) => value.toLowerCase().includes(search));
       return matchesSearch && (statusFilter === "All" || lead.leadStatus === statusFilter);
     });
-  }, [beneficiaryLeads, query, statusFilter]);
+  }, [beneficiaryLeads, query, statusFilter, duplicatesOnly, isFieldworker, user?.id, user?.name]);
 
-  const assignedCount = beneficiaryLeads.filter((lead) => lead.assignedTo).length;
-  const awaitingCount = beneficiaryLeads.filter(
+  const visibleLeads = isFieldworker
+    ? beneficiaryLeads.filter((lead) => lead.assignedTo === user?.id || lead.assignedTo === user?.name)
+    : beneficiaryLeads;
+  const assignedCount = visibleLeads.filter((lead) => lead.assignedTo).length;
+  const awaitingCount = visibleLeads.filter(
     (lead) => lead.leadStatus === "Visit pending" || lead.leadStatus === "Assigned",
   ).length;
-  const duplicateCount = beneficiaryLeads.filter((lead) => lead.duplicateFlag).length;
+  const duplicateCount = visibleLeads.filter((lead) => lead.duplicateFlag).length;
+
+  const importLeadFile = async (file: File) => {
+    setImporting(true);
+    try {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: false });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      if (!sheet) throw new Error("The selected workbook has no sheets.");
+      const sourceRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
+      const get = (row: Record<string, unknown>, aliases: string[]) => {
+        const values = new Map(Object.entries(row).map(([key, value]) => [
+          key.toLowerCase().replace(/[^a-z0-9]/g, ""),
+          String(value ?? "").trim(),
+        ]));
+        for (const alias of aliases) {
+          const value = values.get(alias.toLowerCase().replace(/[^a-z0-9]/g, ""));
+          if (value) return value;
+        }
+        return "";
+      };
+      const rows = sourceRows.flatMap((row) => {
+        const fullNames = get(row, ["full names", "first name", "given names", "names", "applicant name", "beneficiary name"]);
+        const surname = get(row, ["surname", "last name", "family name"]);
+        const project = get(row, ["project", "project name"]);
+        if ((!fullNames && !surname) || !project) return [];
+        return [{
+          project,
+          programme: get(row, ["programme", "program", "subsidy"]) || "Not specified",
+          surname,
+          fullNames,
+          idNo: get(row, ["id number", "id no", "identity number"]),
+          siteNo: get(row, ["site number", "site no", "plot", "plot number"]),
+          township: get(row, ["township", "ward", "area", "location"]),
+          sourceData: Object.fromEntries(Object.entries(row).map(([key, value]) => [key, String(value ?? "")])),
+        }];
+      });
+      if (!rows.length) throw new Error("No usable beneficiaries found. Include name/surname and project columns.");
+      const rejected = sourceRows.length - rows.length;
+      const result = importLeads(file.name, rows, rejected);
+      notify(`Imported ${result.accepted} beneficiary lead(s); ${result.duplicates} possible duplicate(s) flagged${rejected ? `; skipped ${rejected} invalid row(s)` : ""}`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Could not import beneficiary list", "error");
+    } finally {
+      setImporting(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  };
 
   return (
     <div className="page-stack lead-workspace">
@@ -79,19 +152,32 @@ export default function LeadManagement() {
           <p>Track incoming beneficiary records and field follow-up in one place.</p>
         </div>
         <div className="lead-hero-actions">
+          <input
+            ref={fileInput}
+            className="sr-only"
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            aria-label="Import beneficiary file"
+            disabled={!canAssign || importing}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void importLeadFile(file);
+            }}
+          />
           <button
             type="button"
             className="button button-quiet"
-            onClick={() => notify("Duplicate review opens in Phase 2")}
+            onClick={() => setDuplicatesOnly((value) => !value)}
           >
-            <CheckCircle2 size={15} /> Review duplicates
+            <CheckCircle2 size={15} />{duplicatesOnly ? "Show all leads" : "Review duplicates"}
           </button>
           <button
             type="button"
             className="button button-primary"
-            onClick={() => notify("Departmental lead import opens in Phase 1")}
+            disabled={!canAssign || importing}
+            onClick={() => fileInput.current?.click()}
           >
-            <ArrowUpRight size={15} /> Import lead list
+            <FileSpreadsheet size={15} />{importing ? "Importing…" : "Import lead list"}
           </button>
         </div>
       </header>
@@ -99,7 +185,7 @@ export default function LeadManagement() {
       <section className="lead-metrics" aria-label="Lead summary">
         <article className="lead-metric">
           <span className="lead-metric-icon lead-icon-ink"><Users size={17} /></span>
-          <div><span>Total leads</span><strong>{beneficiaryLeads.length}</strong></div>
+          <div><span>Total leads</span><strong>{visibleLeads.length}</strong></div>
           <small>in the register</small>
         </article>
         <article className="lead-metric">
@@ -124,9 +210,9 @@ export default function LeadManagement() {
           <div>
             <SectionEyebrow>Field allocation</SectionEyebrow>
             <h2>Beneficiary leads</h2>
-            <p>Search the register or filter by follow-up status.</p>
+            <p>{canAssign ? "Search the register, review duplicates, assign fieldworkers, or import a source file." : "Your assigned beneficiary follow-up records."}</p>
           </div>
-          <span className="lead-result-count">{filteredLeads.length} of {beneficiaryLeads.length}</span>
+          <span className="lead-result-count">{filteredLeads.length} of {visibleLeads.length}</span>
         </div>
 
         <div className="lead-toolbar">
@@ -151,6 +237,7 @@ export default function LeadManagement() {
             </select>
           </label>
         </div>
+        {canAssign && workersError && <p className="auth-error" role="alert">{workersError}</p>}
 
         {filteredLeads.length > 0 ? (
           <div className="lead-card-grid">
@@ -181,7 +268,19 @@ export default function LeadManagement() {
                 <div className="lead-card-footer">
                   <div className="lead-assignee">
                     <span>Assigned to</span>
-                    <strong>{lead.assignedTo ?? "Unassigned"}</strong>
+                    {canAssign ? (
+                      <select
+                        value={lead.assignedTo ?? ""}
+                        aria-label={`Assign ${displayName(lead)}`}
+                        disabled={!workers.length}
+                        onChange={(event) => assignLeads([lead.id], event.target.value || null)}
+                      >
+                        <option value="">Unassigned</option>
+                        {workers.map((worker) => <option key={worker.id} value={worker.id}>{worker.name}</option>)}
+                      </select>
+                    ) : (
+                      <strong>{workers.find((worker) => worker.id === lead.assignedTo)?.name ?? (lead.assignedTo === user?.id ? currentUser.name : lead.assignedTo ?? "Unassigned")}</strong>
+                    )}
                   </div>
                   <div className="lead-card-flags">
                     <span className={`lead-status lead-status-${sourceTone(lead.sourceStatus)}`}>{lead.sourceStatus}</span>
@@ -194,8 +293,8 @@ export default function LeadManagement() {
         ) : (
           <div className="lead-empty">
             <span><Search size={19} /></span>
-            <h3>{beneficiaryLeads.length ? "No leads match your search" : "No beneficiary leads yet"}</h3>
-            <p>{beneficiaryLeads.length ? "Try a different name or status filter." : "Imported leads will appear here after the first list is processed."}</p>
+            <h3>{visibleLeads.length ? "No leads match your search" : "No beneficiary leads yet"}</h3>
+            <p>{visibleLeads.length ? (workersError || "Try a different name or status filter.") : canAssign ? "Import a CSV or Excel file to add beneficiary leads." : "No beneficiary leads are assigned to your account yet."}</p>
             {(query || statusFilter !== "All") && (
               <button type="button" className="button button-quiet" onClick={() => { setQuery(""); setStatusFilter("All"); }}>
                 Clear filters

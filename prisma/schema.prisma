@@ -86,6 +86,7 @@ model CaseRecord {
   updated            String
   members            Int
   site               String
+  assignedTo         String?
   sources            Json?
   intakeId           String?
   latestVisitSummary Json?

@@ -142,6 +142,7 @@ const WorkspaceCase = z.object({
   updated: z.string(),
   members: z.number().int(),
   site: z.string(),
+  assignedTo: z.string().nullable().optional(),
   sources: z.array(z.record(z.string(), z.unknown())).optional(),
   intakeId: z.string().nullable().optional(),
   latestVisitSummary: z.record(z.string(), z.unknown()).nullable().optional(),
@@ -273,6 +274,7 @@ async function syncWorkspaceEntities(
       updated: record.updated,
       members: record.members,
       site: record.site,
+      assignedTo: record.assignedTo ?? null,
       sources: record.sources as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
       intakeId: record.intakeId ?? null,
       latestVisitSummary: record.latestVisitSummary as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
@@ -522,7 +524,11 @@ app.addHook("preHandler", async (request, reply) => {
 
 app.addHook("preHandler", async (request, reply) => {
   const route = request.url.split("?")[0];
-  if (route !== "/api/state" && route !== "/api/overview" && route !== "/api/configuration" && route !== "/api/visits" && !route.startsWith("/api/visits/")) return;
+  if (
+    route !== "/api/state" && route !== "/api/overview" && route !== "/api/configuration"
+    && route !== "/api/branches/workers" && route !== "/api/assignments/cases"
+    && route !== "/api/visits" && !route.startsWith("/api/visits/")
+  ) return;
   const branchHeader = request.headers["x-branch-id"];
   const branchId = Array.isArray(branchHeader) ? branchHeader[0] : branchHeader;
   if (!branchId) return reply.code(400).send({ error: "branch_selection_required" });
@@ -661,6 +667,108 @@ app.get("/api/branches/mine", async (request, reply) => {
       isDefault: "isDefault" in branch ? branch.isDefault : branch.id === DEFAULT_BRANCH_ID,
     })),
   };
+});
+
+app.get("/api/branches/workers", async (request, reply) => {
+  const actor = request.authUser;
+  if (!actor) return reply.code(401).send({ error: "unauthorized" });
+  if (actor.role !== "admin" && actor.role !== "supervisor") {
+    return reply.code(403).send({ error: "assignment_forbidden" });
+  }
+  if (actor.email.endsWith("@local.ayavelisa.test")) {
+    return {
+      workers: [
+        { id: "Lindiwe Ndlovu", name: "Lindiwe Ndlovu", email: "fieldworker@local.ayavelisa.test" },
+      ],
+    };
+  }
+  const branchHeader = request.headers["x-branch-id"];
+  const branchId = Array.isArray(branchHeader) ? branchHeader[0] : branchHeader;
+  if (!branchId) return reply.code(400).send({ error: "branch_selection_required" });
+  const membership = await prisma.userBranch.findUnique({
+    where: { userId_branchId: { userId: actor.id, branchId } },
+    select: { userId: true },
+  });
+  if (!membership) return reply.code(403).send({ error: "branch_access_denied" });
+  const users = await prisma.user.findMany({
+    where: { active: true, role: "fieldworker", branchMemberships: { some: { branchId } } },
+    select: { id: true, name: true, email: true },
+    orderBy: { name: "asc" },
+  });
+  return { workers: users };
+});
+
+app.post("/api/assignments/cases", async (request, reply) => {
+  const actor = request.authUser;
+  if (!actor) return reply.code(401).send({ error: "unauthorized" });
+  if (actor.role !== "admin" && actor.role !== "supervisor") {
+    return reply.code(403).send({ error: "assignment_forbidden" });
+  }
+  const parsed = z.object({
+    caseIds: z.array(z.string().min(1)).min(1).max(100),
+    workerId: z.string().min(1),
+    scheduledFor: z.string().datetime(),
+  }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "invalid_assignment", issues: parsed.error.issues });
+  const branchId = request.branchId;
+  if (!branchId) return reply.code(400).send({ error: "branch_selection_required" });
+  const isLocalDemoUser = actor.email.endsWith("@local.ayavelisa.test");
+
+  const worker = await prisma.user.findFirst({
+    where: {
+      id: parsed.data.workerId,
+      role: "fieldworker",
+      active: true,
+      branchMemberships: { some: { branchId } },
+    },
+    select: { id: true, name: true },
+  });
+  const localWorker = isLocalDemoUser && parsed.data.workerId === "Lindiwe Ndlovu"
+    ? { id: "Lindiwe Ndlovu", name: "Lindiwe Ndlovu" }
+    : null;
+  const assignee = worker ?? localWorker;
+  if (!assignee) return reply.code(400).send({ error: "fieldworker_not_in_branch" });
+
+  const caseIds = [...new Set(parsed.data.caseIds)];
+  const branchCases = await prisma.branchCase.findMany({
+    where: { branchId, caseId: { in: caseIds }, case: { archivedAt: null } },
+    select: { caseId: true },
+  });
+  if (branchCases.length !== caseIds.length) return reply.code(404).send({ error: "case_not_found_in_branch" });
+
+  const scheduledFor = new Date(parsed.data.scheduledFor);
+  const visits = await prisma.$transaction(async (transaction) => {
+    await transaction.caseRecord.updateMany({
+      where: { id: { in: caseIds }, branches: { some: { branchId } } },
+      data: { assignedTo: assignee.name },
+    });
+    return Promise.all(caseIds.map(async (caseId) => {
+      const currentVisit = await transaction.visit.findFirst({
+        where: { caseId, status: "assigned" },
+        orderBy: { createdAt: "desc" },
+        select: { id: true, version: true },
+      });
+      if (currentVisit) {
+        return transaction.visit.update({
+          where: { id: currentVisit.id },
+          data: { assignedTo: assignee.id, scheduledFor, version: { increment: 1 } },
+          select: { id: true, caseId: true, assignedTo: true, scheduledFor: true, status: true, version: true },
+        });
+      }
+      return transaction.visit.create({
+        data: {
+          id: `VIS-${crypto.randomUUID()}`,
+          caseId,
+          assignedTo: assignee.id,
+          scheduledFor,
+          status: "assigned",
+          version: 1,
+        },
+        select: { id: true, caseId: true, assignedTo: true, scheduledFor: true, status: true, version: true },
+      });
+    }));
+  });
+  return reply.code(201).send({ assigned: caseIds.length, worker: assignee, visits });
 });
 
 app.get("/api/admin/branches", async (request, reply) => {
@@ -1253,6 +1361,21 @@ app.put("/api/state", async (request, reply) => {
     );
     if (forbiddenChanges.length > 0) {
       return reply.code(403).send({ error: "role_cannot_change_workspace_sections", sections: forbiddenChanges });
+    }
+    if (role !== "admin" && role !== "supervisor") {
+      const previousCases = Array.isArray(previousState.cases) ? previousState.cases as Array<Record<string, unknown>> : [];
+      const nextCases = Array.isArray(parsed.data.state.cases) ? parsed.data.state.cases as Array<Record<string, unknown>> : [];
+      const caseAssignments = new Map(previousCases.map((record) => [record.id, record.assignedTo ?? null]));
+      const previousLeads = Array.isArray(previousState.beneficiaryLeads)
+        ? previousState.beneficiaryLeads as Array<Record<string, unknown>>
+        : [];
+      const nextLeads = Array.isArray(parsed.data.state.beneficiaryLeads)
+        ? parsed.data.state.beneficiaryLeads as Array<Record<string, unknown>>
+        : [];
+      const leadAssignments = new Map(previousLeads.map((record) => [record.id, record.assignedTo ?? null]));
+      const changedAssignment = nextCases.some((record) => caseAssignments.get(record.id) !== (record.assignedTo ?? null))
+        || nextLeads.some((record) => leadAssignments.get(record.id) !== (record.assignedTo ?? null));
+      if (changedAssignment) return reply.code(403).send({ error: "assignment_forbidden" });
     }
   }
   if ((current && current.version !== parsed.data.version) || (!current && parsed.data.version !== 0)) {

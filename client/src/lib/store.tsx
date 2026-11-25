@@ -7,7 +7,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
-  Activity, Blocker, CaseRecord, Evidence, Intake, Persona, SeedKind, StoreState, VerifyNowResult, Visit, VisitForm,
+  Activity, BeneficiaryLead, Blocker, CaseRecord, Evidence, Intake, Persona, SeedKind, StoreState, VerifyNowResult, Visit, VisitForm,
 } from "./types";
 import { api, ApiError, uploadEvidence } from "./api";
 import {
@@ -46,10 +46,17 @@ type Ctx = StoreState & {
   setSeed: (s: SeedKind) => void;
   resetDemo: () => void;
   createCase: (draft: Pick<CaseRecord, "name" | "household" | "project" | "location" | "source" | "members" | "site">) => CaseRecord;
+  createCases: (drafts: Array<Pick<CaseRecord, "name" | "household" | "project" | "location" | "source" | "members" | "site">>) => number;
   updateCaseRecord: (id: string, patch: Partial<CaseRecord>) => void;
   archiveCase: (id: string) => void;
   restoreCase: (id: string) => void;
-  assignCases: (ids: string[], assignee: string) => void;
+  assignCases: (ids: string[], worker: { id: string; name: string }, scheduledFor: string) => Promise<void>;
+  assignLeads: (ids: string[], workerId: string | null) => void;
+  importLeads: (
+    fileName: string,
+    rows: Array<Pick<BeneficiaryLead, "project" | "programme" | "surname" | "fullNames" | "idNo" | "siteNo" | "township" | "sourceData">>,
+    rejectedCount?: number,
+  ) => { accepted: number; duplicates: number };
   runVerifyNowChecks: (ids: string[]) => VerifyNowResult[];
   markDepartmentPacketExported: (id: string) => void;
 
@@ -414,6 +421,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return created;
   }, [state.cases, currentUser.name, persona, activeBranchId]);
 
+  const createCases = useCallback((drafts: Array<Pick<CaseRecord, "name" | "household" | "project" | "location" | "source" | "members" | "site">>) => {
+    if (!drafts.length) return 0;
+    const year = new Date().getFullYear();
+    const branchSuffix = activeBranchId && activeBranchId !== "eastern-cape-delivery"
+      ? `-${activeBranchId.slice(0, 6).toUpperCase()}`
+      : "";
+    setState((current) => {
+      let sequence = current.cases.reduce((highest, item) => {
+        const [prefix, itemYear, number] = item.id.split("-");
+        return prefix === "AY" && Number(itemYear) === year && Number.isFinite(Number(number))
+          ? Math.max(highest, Number(number))
+          : highest;
+      }, 0);
+      const created = drafts.map((draft) => ({
+        ...draft,
+        id: `AY-${year}-${String(++sequence).padStart(4, "0")}${branchSuffix}`,
+        verification: "Awaiting review",
+        verificationTone: "warning" as const,
+        subsidy: "Not started",
+        subsidyTone: "neutral" as const,
+        readiness: "Not started",
+        nextAction: "Complete field verification",
+        updated: "Just now",
+      }));
+      const now = new Date().toISOString();
+      return {
+        ...current,
+        cases: [...created, ...current.cases],
+        activities: [
+          ...created.map((record) => act("action", "blue", "Case imported", record.id)),
+          ...current.activities,
+        ].slice(0, 40),
+        auditLog: [
+          ...created.map((record) => ({
+            id: uid(), at: now, actor: currentUser.name, persona,
+            action: "import", entity: "case", entityId: record.id, before: null, after: record, reason: null,
+          })),
+          ...current.auditLog,
+        ],
+      };
+    });
+    return drafts.length;
+  }, [activeBranchId, currentUser.name, persona]);
+
   const updateCaseRecord = useCallback((id: string, patch: Partial<CaseRecord>) => setState((s) => {
     const before = s.cases.find((item) => item.id === id);
     if (!before) throw new Error(`Case ${id} was not found`);
@@ -459,11 +510,107 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
   }), [currentUser.name, persona]);
 
-  const assignCases = useCallback((ids: string[], assignee: string) => setState((s) => ({
-    ...s,
-    cases: s.cases.map((item) => ids.includes(item.id) && !item.archivedAt ? { ...item, assignedTo: assignee, updated: "Just now" } : item),
-    activities: [act("action", "blue", "Cases assigned", `${ids.length} case(s) · ${assignee}`), ...s.activities].slice(0, 40),
+  const assignCases = useCallback(async (ids: string[], worker: { id: string; name: string }, scheduledFor: string) => {
+    await api.post("/api/assignments/cases", { caseIds: ids, workerId: worker.id, scheduledFor });
+    setState((current) => ({
+      ...current,
+      cases: current.cases.map((item) =>
+        ids.includes(item.id) && !item.archivedAt
+          ? { ...item, assignedTo: worker.name, updated: "Just now" }
+          : item,
+      ),
+      activities: [act("action", "blue", "Cases assigned", `${ids.length} case(s) · ${worker.name}`), ...current.activities].slice(0, 40),
+    }));
+    await refreshVisitsAfterStateSave.current();
+  }, []);
+
+  const assignLeads = useCallback((ids: string[], workerId: string | null) => setState((current) => ({
+    ...current,
+    beneficiaryLeads: current.beneficiaryLeads.map((lead) =>
+      ids.includes(lead.id)
+        ? { ...lead, assignedTo: workerId, leadStatus: workerId ? "Assigned" : "New", lastUpdatedAt: new Date().toISOString() }
+        : lead,
+    ),
   })), []);
+
+  const importLeads = useCallback((
+    fileName: string,
+    rows: Array<Pick<BeneficiaryLead, "project" | "programme" | "surname" | "fullNames" | "idNo" | "siteNo" | "township" | "sourceData">>,
+    rejectedCount = 0,
+  ) => {
+    const existingLeads = state.beneficiaryLeads;
+    const isDuplicate = (row: typeof rows[number], earlierRows: typeof rows) =>
+      Boolean(
+        (row.idNo && existingLeads.some((lead) => lead.idNo && lead.idNo === row.idNo))
+        || existingLeads.some((lead) =>
+          lead.fullNames.trim().toLowerCase() === row.fullNames.trim().toLowerCase()
+          && lead.surname.trim().toLowerCase() === row.surname.trim().toLowerCase()
+          && lead.project.trim().toLowerCase() === row.project.trim().toLowerCase(),
+        )
+        || earlierRows.some((previous) =>
+          (row.idNo && previous.idNo && row.idNo === previous.idNo)
+          || (previous.fullNames.trim().toLowerCase() === row.fullNames.trim().toLowerCase()
+            && previous.surname.trim().toLowerCase() === row.surname.trim().toLowerCase()
+            && previous.project.trim().toLowerCase() === row.project.trim().toLowerCase()),
+        ),
+      );
+    const duplicateIndexes = new Set<number>();
+    rows.forEach((row, index) => {
+      if (isDuplicate(row, rows.slice(0, index))) duplicateIndexes.add(index);
+    });
+    setState((current) => {
+      const year = new Date().getFullYear();
+      const sequenceStart = current.beneficiaryLeads.reduce((highest, lead) => {
+        const sequence = Number(lead.leadRef.split("-").at(-1));
+        return Number.isFinite(sequence) ? Math.max(highest, sequence) : highest;
+      }, 0);
+      const batchSequence = current.leadImportBatches.length + 1;
+      const batchRef = `DEP-${year}-${String(batchSequence).padStart(3, "0")}`;
+      const importedAt = new Date().toISOString();
+      const leads: BeneficiaryLead[] = rows.map((row, index) => {
+        const duplicateFlag = duplicateIndexes.has(index);
+        const leadRef = `BL-${year}-${String(sequenceStart + index + 1).padStart(4, "0")}`;
+        return {
+          ...row,
+          id: uid(),
+          leadRef,
+          batchRef,
+          sourceStatus: "Received",
+          leadStatus: "New",
+          assignedTo: null,
+          createdAt: importedAt,
+          lastUpdatedAt: importedAt,
+          linkedEnquiryId: null,
+          visitHistory: [],
+          duplicateFlag,
+        };
+      });
+      const extension = fileName.toLowerCase().split(".").at(-1);
+      const batch = {
+        id: uid(),
+        batchRef,
+        project: rows[0]?.project ?? "Imported beneficiary list",
+        programme: rows[0]?.programme ?? "Not specified",
+        sourceFileName: fileName,
+        importingUser: currentUser.name,
+        importedAt,
+        rowCount: rows.length,
+        acceptedCount: rows.length,
+        rejectedCount,
+        duplicateCount: duplicateIndexes.size,
+        columnMapping: {},
+        fileType: extension === "csv" ? "csv" as const : "xlsx" as const,
+        retentionRef: `source/${batchRef}/${fileName}`,
+      };
+      return {
+        ...current,
+        beneficiaryLeads: [...leads, ...current.beneficiaryLeads],
+        leadImportBatches: [batch, ...current.leadImportBatches],
+        activities: [act("intake", "blue", "Beneficiary list imported", `${batchRef} · ${leads.length} rows`), ...current.activities].slice(0, 40),
+      };
+    });
+    return { accepted: rows.length, duplicates: duplicateIndexes.size };
+  }, [currentUser.name, state.beneficiaryLeads]);
 
   const runVerifyNowChecks = useCallback((ids: string[]) => {
     const selected = new Set(ids);
@@ -978,7 +1125,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     branches, activeBranch, activeBranchId, branchesLoading, branchError, selectBranch, refreshBranches,
     setPersona, setSeed, resetDemo,
     startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
-    createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,
+    createCase, createCases, updateCaseRecord, archiveCase, restoreCase, assignCases, assignLeads, importLeads, runVerifyNowChecks, markDepartmentPacketExported,
     requestBlocker, assignBlocker, resolveBlocker,
     createIntakeDraft, saveIntake, submitIntake, approveIntake, returnIntake, linkIntake, discardIntake,
     visitsFromApi, visitsLoaded, visitsLoading, visitsError,
@@ -988,7 +1135,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     branches, activeBranch, activeBranchId, branchesLoading, branchError, selectBranch, refreshBranches,
     setPersona, setSeed, resetDemo,
     startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
-    createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,
+    createCase, createCases, updateCaseRecord, archiveCase, restoreCase, assignCases, assignLeads, importLeads, runVerifyNowChecks, markDepartmentPacketExported,
     requestBlocker, assignBlocker, resolveBlocker,
     createIntakeDraft, saveIntake, submitIntake, approveIntake, returnIntake, linkIntake, discardIntake,
     visitsFromApi, visitsLoaded, visitsLoading, visitsError,

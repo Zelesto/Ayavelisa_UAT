@@ -28,7 +28,7 @@ The app's current screens share one persisted workspace document in PostgreSQL. 
 ## Protected demo deployment
 
 - The repository includes a Render Blueprint for a free demo web service. Connect the GitHub repository in Render and provide the environment variables from `.env.example` in the Render dashboard; never commit live values. Free instances can sleep when idle and take time to wake.
-- The Render start command runs `prisma migrate deploy` against Supabase using `DIRECT_URL`; do not apply the same migration manually in the Supabase SQL Editor.
+- The Render start command applies the Prisma schema against Supabase using `DIRECT_URL`; do not apply the same migration manually in the Supabase SQL Editor.
 - Enable email/password sign-in in Supabase Auth and keep public sign-ups disabled. Create the first admin user in Supabase Auth; set its exact email in `SUPABASE_BOOTSTRAP_ADMIN_EMAILS`. On its first sign-in, that account is provisioned as an Ayavelisa administrator.
 - Set `SUPABASE_URL` and `SUPABASE_ANON_KEY` for session validation, and `SUPABASE_SERVICE_ROLE_KEY` for server-side invitations, linking existing Auth accounts, confirming accounts, deleting Auth users, and looking up managed users to resend access emails. The service-role secret must be a private Render environment variable and must never be exposed to the browser or committed.
 - Configure `SUPABASE_BOOTSTRAP_ADMIN_EMAILS`, `DATABASE_URL`, `DIRECT_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` in Render. `SUPABASE_SERVICE_ROLE_KEY` is required for invitations, existing-account linking, confirming/deleting accounts and access-email resends; without it, sign-in and role management still work. The browser build additionally needs `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. All Supabase variables must refer to the same project.
@@ -41,6 +41,8 @@ The app's current screens share one persisted workspace document in PostgreSQL. 
 
 - Visit evidence-source choices are interactive, and editable visit/case forms expose a free-text field when an "Other" option is selected.
 - Cases can be created, edited, assigned individually or in bulk, and archived/restored. Archive is a soft delete.
+- Supervisors and administrators can import case spreadsheets (CSV/XLS/XLSX); required columns are applicant name, project and location (ward/area are accepted for location). Optional columns include household, source/programme, household members and site/plot.
+- Beneficiary leads can be imported from CSV/XLS/XLSX with name or surname and project columns, reviewed for possible duplicates, and assigned to active fieldworkers in the selected branch. Case assignments schedule database-backed visits for the selected fieldworker and date.
 - Reviewers can record a VerifyNow request from a review or case screen. The provider API is not configured in this demo, so requests are explicitly marked `not_configured`; no external check is performed and no result is fabricated.
 - Cases and reports can be exported as Excel, PDF, or CSV. A department packet export is a draft download only; it is not submitted to a department system.
 - A case is not department-ready based on a recorded request alone. Configure and integrate the real VerifyNow provider before treating external verification as complete.
