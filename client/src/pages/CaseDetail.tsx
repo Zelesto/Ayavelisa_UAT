@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -25,6 +26,7 @@ import { navigate } from "@/lib/router";
 import { useStore } from "@/lib/store";
 import { MissingState, SectionEyebrow, StatusPill, cx, useToast } from "@/components/ui";
 import { exportDepartmentPacket, type ExportFormat } from "@/lib/caseExport";
+import { api } from "@/lib/api";
 import type { Blocker, Tone } from "@/lib/types";
 
 function StatusDimension({
@@ -68,7 +70,7 @@ function CheckRow({
   return (
     <div className="check-row">
       <div className={cx("check-icon", `check-${tone}`)}>
-        {tone === "success" ? <Check size={14} /> : tone === "warning" ? <Clock3 size={14} /> : <AlertTriangle size={14} />}
+        {tone === "success" ? <Check size={14} /> : tone === "warning" ? <Clock3 size={14} /> : <Info size={14} />}
       </div>
       <div className="check-copy">
         <strong>{label}</strong>
@@ -80,8 +82,20 @@ function CheckRow({
 }
 
 export default function CaseDetail({ caseId }: { caseId: string }) {
-  const { cases, visits, blockers, requestBlocker, assignBlocker, resolveBlocker, isSyncing, runSync, runVerifyNowChecks, markDepartmentPacketExported } = useStore();
+  const { cases, visits, blockers, requestBlocker, assignBlocker, resolveBlocker, isSyncing, runSync, runVerifyNowChecks, markDepartmentPacketExported, activeBranchId } = useStore();
   const { notify } = useToast();
+  const [checklist, setChecklist] = useState<{
+    title: string;
+    version: string;
+    eligibilityRules: Array<{ id: string; label: string; description: string; required: boolean; evidenceTypes: string[] }>;
+  } | null>(null);
+
+  useEffect(() => {
+    setChecklist(null);
+    api.get<{ data: typeof checklist; version: number }>("/api/configuration")
+      .then(({ data }) => setChecklist(data))
+      .catch((error: unknown) => notify(error instanceof Error ? error.message : "Could not load the branch checklist", "error"));
+  }, [activeBranchId, notify]);
 
   const item = cases.find((record) => record.id === caseId);
 
@@ -364,29 +378,23 @@ export default function CaseDetail({ caseId }: { caseId: string }) {
             </div>
             <div className="subsidy-progress">
               <div>
-                <strong>7 of 9 checklist items</strong>
-                <span>Pack is not yet ready for official submission</span>
+                <strong>{checklist ? `${checklist.eligibilityRules.length} checklist requirements` : "Loading checklist…"}</strong>
+                <span>{checklist?.title ? `${checklist.title} · version ${checklist.version}` : "Checklist rules are managed in branch configuration"}</span>
               </div>
-              <div className="mini-progress">
-                <div style={{ width: "78%" }} />
-              </div>
-              <span className="percentage">78%</span>
             </div>
             <div className="check-list">
-              <CheckRow label="Applicant and household details" status="Complete" source="Verified data · form v2.3" />
-              <CheckRow
-                label="Identity and residency evidence"
-                status="1 missing"
-                source="Proof of residence required"
-                tone="warning"
-              />
-              <CheckRow
-                label="Prior assistance check"
-                status="Unconfirmed"
-                source="Awaiting authorised source evidence"
-                tone="warning"
-              />
-              <CheckRow label="Signed acknowledgement" status="Captured" source="isiXhosa witnessed alternative · 10 Nov" />
+              {checklist?.eligibilityRules.map((rule) => (
+                <CheckRow
+                  key={rule.id}
+                  label={rule.label}
+                  status={rule.required ? "Required" : "Optional"}
+                  source={rule.evidenceTypes.length ? `Evidence: ${rule.evidenceTypes.join(", ")}` : rule.description || "No additional guidance"}
+                  tone="neutral"
+                />
+              ))}
+              {checklist && checklist.eligibilityRules.length === 0 && (
+                <p className="capture-note">No eligibility requirements have been configured for this branch.</p>
+              )}
             </div>
             <div className="subsidy-footer">
               <span>
@@ -396,7 +404,7 @@ export default function CaseDetail({ caseId }: { caseId: string }) {
               <button
                 type="button"
                 className="button button-outline"
-                onClick={() => notify("Checklist v2.3 · 9 requirements · 2 outstanding")}
+                onClick={() => navigate("/configuration")}
               >
                 Review checklist <ArrowRight size={14} />
               </button>

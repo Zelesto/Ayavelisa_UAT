@@ -1,179 +1,230 @@
-import {
-  ArrowRight,
-  ArrowUpRight,
-  ClipboardCheck,
-  HardHat,
-  LockKeyhole,
-  Plus,
-  ShieldCheck,
-  UserRound,
-} from "lucide-react";
+import { useEffect, useState, type FormEvent } from "react";
+import { Plus, Save, Trash2 } from "lucide-react";
 import { useStore } from "@/lib/store";
+import { api, ApiError } from "@/lib/api";
 import { SectionEyebrow, StatusPill, useToast } from "@/components/ui";
 import { useAuth } from "@/components/AuthGate";
-import { navigate } from "@/lib/router";
+
+type EligibilityRule = {
+  id: string;
+  label: string;
+  description: string;
+  required: boolean;
+  evidenceTypes: string[];
+};
+
+type BranchConfigurationData = {
+  title: string;
+  version: string;
+  effectiveOn: string;
+  owner: string;
+  eligibilityRules: EligibilityRule[];
+};
+
+const blankConfiguration = (owner: string): BranchConfigurationData => ({
+  title: "",
+  version: "1.0",
+  effectiveOn: "",
+  owner,
+  eligibilityRules: [],
+});
 
 export default function Configuration() {
-  const { resetDemo } = useStore();
+  const { activeBranch, activeBranchId } = useStore();
   const { user } = useAuth();
   const { notify } = useToast();
+  const [data, setData] = useState<BranchConfigurationData>(() => blankConfiguration(user?.name ?? ""));
+  const [version, setVersion] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const canEdit = user?.role === "admin" || user?.role === "supervisor";
+
+  useEffect(() => {
+    if (!activeBranchId) return;
+    let active = true;
+    setLoading(true);
+    setLoadError("");
+    api.get<{ data: BranchConfigurationData | null; version: number }>("/api/configuration")
+      .then((result) => {
+        if (!active) return;
+        setData(result.data ?? blankConfiguration(user?.name ?? ""));
+        setVersion(result.version);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof ApiError ? error.message : error instanceof Error ? error.message : "Could not load configuration.";
+        setLoadError(message);
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [activeBranchId, user?.name]);
+
+  const update = <K extends keyof BranchConfigurationData>(key: K, value: BranchConfigurationData[K]) => {
+    setData((current) => ({ ...current, [key]: value }));
+  };
+
+  const updateRule = (id: string, patch: Partial<EligibilityRule>) => {
+    setData((current) => ({
+      ...current,
+      eligibilityRules: current.eligibilityRules.map((rule) => rule.id === id ? { ...rule, ...patch } : rule),
+    }));
+  };
+
+  const addRule = () => {
+    setData((current) => ({
+      ...current,
+      eligibilityRules: [...current.eligibilityRules, {
+        id: crypto.randomUUID(),
+        label: "",
+        description: "",
+        required: true,
+        evidenceTypes: [],
+      }],
+    }));
+  };
+
+  const removeRule = (id: string) => {
+    setData((current) => ({ ...current, eligibilityRules: current.eligibilityRules.filter((rule) => rule.id !== id) }));
+  };
+
+  const saveConfiguration = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!activeBranchId) return;
+    setSaving(true);
+    try {
+      const saved = await api.put<{ data: BranchConfigurationData; version: number }>("/api/configuration", { version, data });
+      setData(saved.data);
+      setVersion(saved.version);
+      notify("Branch checklist and eligibility rules saved");
+    } catch (error) {
+      const message = error instanceof ApiError && error.code === "configuration_conflict"
+        ? "Configuration changed elsewhere. Reload the page before saving."
+        : error instanceof Error ? error.message : "Could not save configuration.";
+      notify(message, "error");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <>
       <div className="page-heading">
         <div>
           <SectionEyebrow>Governance / Configuration</SectionEyebrow>
-          <h1>Rules you can see and version</h1>
-          <p>Programme rules, checklists and roles stay configurable without hiding policy decisions in code.</p>
+          <h1>Checklist and eligibility</h1>
+          <p>Manage the active programme checklist for {activeBranch?.name ?? "this branch"}.</p>
         </div>
         <div className="heading-actions">
-          {import.meta.env.DEV && !user && (
-            <button
-              type="button"
-              className="button button-quiet"
-              onClick={() => {
-                resetDemo();
-                notify("Demo state restored to seed data");
-              }}
-            >
-              Reset demo state
-            </button>
-          )}
-          <button
-            type="button"
-            className="button button-primary"
-            onClick={() => notify("Configuration wizard opens in Phase 1")}
-          >
-            <Plus size={17} />
-            New configuration
-          </button>
+          <StatusPill label={canEdit ? "Editable" : "View only"} tone={canEdit ? "success" : "neutral"} />
         </div>
       </div>
 
-      <div className="config-grid">
-        <section className="panel config-card">
-          <div className="config-card-icon">
-            <ClipboardCheck size={18} />
-          </div>
-          <SectionEyebrow>Active checklist</SectionEyebrow>
-          <h2>Individual subsidy · v2.3</h2>
-          <p>Effective 01 Oct 2026 · Owner: Ayavelisa programme lead</p>
-          <div className="config-details">
-            <span>9 requirements</span>
-            <span>3 evidence types</span>
-            <StatusPill label="Approved" tone="success" />
-          </div>
-          <button
-            type="button"
-            className="text-button"
-            onClick={() => notify("Checklist v2.3 · 9 requirements")}
-          >
-            View checklist version <ArrowRight size={13} />
-          </button>
+      {loading ? (
+        <section className="panel config-loading" role="status">Loading branch configuration…</section>
+      ) : loadError ? (
+        <section className="panel config-loading" role="alert">
+          <p>{loadError}</p>
+          <button type="button" className="button button-quiet" onClick={() => window.location.reload()}>Reload configuration</button>
         </section>
-
-        <section className="panel config-card">
-          <div className="config-card-icon">
-            <ShieldCheck size={18} />
-          </div>
-          <SectionEyebrow>Status vocabulary</SectionEyebrow>
-          <h2>Separate decisions</h2>
-          <p>
-            Field verification, screening, official outcome, readiness, NHBRC, construction and handover remain
-            independent.
-          </p>
-          <div className="status-stack">
-            <StatusPill label="Internally verified" tone="success" />
-            <StatusPill label="Officially pending" tone="warning" />
-            <StatusPill label="Readiness blocked" tone="danger" />
-          </div>
-          <button
-            type="button"
-            className="text-button"
-            onClick={() => notify("Status vocabulary v1 · 7 dimensions")}
-          >
-            Review status definitions <ArrowRight size={13} />
-          </button>
-        </section>
-
-        <section className="panel config-card">
-          <div className="config-card-icon">
-            <LockKeyhole size={18} />
-          </div>
-          <SectionEyebrow>Access model</SectionEyebrow>
-          <h2>Role-based access</h2>
-          <p>Roles control available screens and workspace changes. All authorized demo accounts share the same records.</p>
-          <div className="access-rows">
-            <span>
-              <UserRound size={14} />
-              Fieldworker <strong>Field capture</strong>
-            </span>
-            <span>
-              <HardHat size={14} />
-              Supervisor <strong>Full workspace</strong>
-            </span>
-            <span>
-              <ShieldCheck size={14} />
-              Reviewer <strong>Review &amp; cases</strong>
-            </span>
-            <span><LockKeyhole size={14} />Administrator <strong>Manage users &amp; roles</strong></span>
-          </div>
-          <button
-            type="button"
-            className="text-button"
-            onClick={() => user?.role === "admin" ? navigate("/users") : notify("Only administrators can manage user accounts")}
-          >
-            {user?.role === "admin" ? "Manage users & roles" : "View role permissions"} <ArrowRight size={13} />
-          </button>
-        </section>
-      </div>
-
-      <section className="panel decision-register">
-        <div className="panel-header">
-          <div>
-            <SectionEyebrow>Discovery decisions</SectionEyebrow>
-            <h2>Open questions before production</h2>
-          </div>
-          <StatusPill label="4 due this phase" tone="warning" />
-        </div>
-
-        {[
-          {
-            id: "D-014",
-            title: "Confirm exact NHBRC project and home checklist",
-            owner: "NHBRC liaison · due 22 Nov 2026",
-            tone: "warning" as const,
-          },
-          {
-            id: "D-017",
-            title: "Confirm programme-specific eligibility rules",
-            owner: "Programme owner · due 25 Nov 2026",
-            tone: "warning" as const,
-          },
-          {
-            id: "D-021",
-            title: "Approve POPIA purpose, retention and hosting basis",
-            owner: "Information Officer · due 29 Nov 2026",
-            tone: "danger" as const,
-          },
-        ].map((d) => (
-          <div className="decision-row" key={d.id}>
-            <span className="decision-id">{d.id}</span>
+      ) : (
+        <form className="panel configuration-editor" onSubmit={(event) => void saveConfiguration(event)}>
+          <div className="panel-header">
             <div>
-              <strong>{d.title}</strong>
-              <span>{d.owner}</span>
+              <SectionEyebrow>Branch-specific · version {data.version || "1.0"}</SectionEyebrow>
+              <h2>Programme checklist</h2>
             </div>
-            <StatusPill label="Open" tone={d.tone} />
-            <button
-              className="icon-button small"
-              type="button"
-              onClick={() => notify(`${d.id} is open in the discovery register`)}
-            >
-              <ArrowUpRight size={15} />
-            </button>
+            {canEdit && (
+              <button type="submit" className="button button-primary" disabled={saving || !data.title.trim() || !data.effectiveOn}>
+                <Save size={16} />{saving ? "Saving…" : "Save configuration"}
+              </button>
+            )}
           </div>
-        ))}
-      </section>
+
+          <div className="configuration-fields">
+            <label>
+              <span>Programme / checklist name</span>
+              <input value={data.title} onChange={(event) => update("title", event.target.value)} required minLength={2} maxLength={160} disabled={!canEdit} />
+            </label>
+            <label>
+              <span>Version</span>
+              <input value={data.version} onChange={(event) => update("version", event.target.value)} required maxLength={40} disabled={!canEdit} />
+            </label>
+            <label>
+              <span>Effective date</span>
+              <input type="date" value={data.effectiveOn} onChange={(event) => update("effectiveOn", event.target.value)} required disabled={!canEdit} />
+            </label>
+            <label>
+              <span>Owner</span>
+              <input value={data.owner} onChange={(event) => update("owner", event.target.value)} required minLength={2} maxLength={120} disabled={!canEdit} />
+            </label>
+          </div>
+
+          <div className="configuration-rules-heading">
+            <div>
+              <h3>Eligibility and checklist requirements</h3>
+              <p>{data.eligibilityRules.length} requirement{data.eligibilityRules.length === 1 ? "" : "s"} configured</p>
+            </div>
+            {canEdit && (
+              <button type="button" className="button button-quiet" onClick={addRule}>
+                <Plus size={16} />Add requirement
+              </button>
+            )}
+          </div>
+
+          {data.eligibilityRules.length === 0 ? (
+            <div className="configuration-empty">
+              <strong>No eligibility requirements configured</strong>
+              <span>{canEdit ? "Add the rules and evidence required for this branch’s programme." : "An administrator or supervisor has not configured this branch’s checklist yet."}</span>
+            </div>
+          ) : (
+            <div className="configuration-rules">
+              {data.eligibilityRules.map((rule, index) => (
+                <section className="configuration-rule" key={rule.id}>
+                  <div className="configuration-rule-heading">
+                    <strong>Requirement {index + 1}</strong>
+                    {canEdit && (
+                      <button type="button" className="icon-button small" aria-label={`Remove requirement ${index + 1}`} onClick={() => removeRule(rule.id)}>
+                        <Trash2 size={15} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="configuration-rule-fields">
+                    <label>
+                      <span>Requirement</span>
+                      <input value={rule.label} onChange={(event) => updateRule(rule.id, { label: event.target.value })} required minLength={2} maxLength={160} disabled={!canEdit} />
+                    </label>
+                    <label>
+                      <span>Evidence types <small>(comma separated)</small></span>
+                      <input
+                        value={rule.evidenceTypes.join(", ")}
+                        onChange={(event) => updateRule(rule.id, { evidenceTypes: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })}
+                        disabled={!canEdit}
+                      />
+                    </label>
+                    <label className="configuration-rule-description">
+                      <span>Eligibility guidance</span>
+                      <textarea value={rule.description} onChange={(event) => updateRule(rule.id, { description: event.target.value })} rows={2} maxLength={1000} disabled={!canEdit} />
+                    </label>
+                    <label className="configuration-required">
+                      <input type="checkbox" checked={rule.required} onChange={(event) => updateRule(rule.id, { required: event.target.checked })} disabled={!canEdit} />
+                      <span>Required for eligibility</span>
+                    </label>
+                  </div>
+                </section>
+              ))}
+            </div>
+          )}
+
+          {canEdit && (
+            <div className="configuration-bottom-actions">
+              <button type="submit" className="button button-primary" disabled={saving || !data.title.trim() || !data.effectiveOn}>
+                <Save size={16} />{saving ? "Saving…" : "Save configuration"}
+              </button>
+            </div>
+          )}
+        </form>
+      )}
     </>
   );
 }

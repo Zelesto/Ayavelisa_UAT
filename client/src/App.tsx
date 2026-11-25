@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react";
 import {
   ArrowRight, Bell, CalendarDays, ChevronDown, ClipboardCheck, ClipboardList, Database, FileText,
-  LayoutDashboard, Map, Menu, MoreHorizontal, PanelLeftClose, PanelLeftOpen, RefreshCw,
+  LayoutDashboard, Map, Menu, MoreHorizontal,
   SlidersHorizontal, Users, Wifi, WifiOff, X,
 } from "lucide-react";
 import { navigate, useRoute } from "@/lib/router";
 import { StoreProvider, useStore, USERS } from "@/lib/store";
 import { supabase } from "@/lib/supabase";
-import { ToastProvider, cx, useToast } from "@/components/ui";
+import { ToastProvider, cx } from "@/components/ui";
 import AuthGate, { useAuth } from "@/components/AuthGate";
 import { ROLE_LABELS, rolePersona, userInitials, type AccountRole } from "@/lib/auth";
 import Overview from "@/pages/Overview";
@@ -24,6 +24,7 @@ import ReviewQueue from "@/pages/ReviewQueue";
 import IntakeReview from "@/pages/IntakeReview";
 import FieldIntake from "@/pages/FieldIntake";
 import UserManagement from "@/pages/UserManagement";
+import Profile from "@/pages/Profile";
 import type { Persona } from "@/lib/types";
 
 type NavItem = { label: string; icon: typeof LayoutDashboard; path: string; count?: string; forPersona?: Persona[] };
@@ -37,9 +38,10 @@ const HOME: Record<Persona, string> = {
 function canAccessPath(role: AccountRole | null, path: string) {
   if (!role) return true;
   const pathname = path.split("?")[0];
+  if (pathname === "/profile") return true;
   if (role === "admin" || role === "supervisor") return pathname !== "/users" || role === "admin";
   if (role === "reviewer") {
-    return pathname === "/" || ["/review", "/review/intake", "/cases", "/leads", "/sites", "/reports"].some((allowed) =>
+    return pathname === "/" || ["/review", "/review/intake", "/cases", "/leads", "/sites", "/reports", "/configuration"].some((allowed) =>
       pathname === allowed || pathname.startsWith(`${allowed}/`),
     );
   }
@@ -59,7 +61,6 @@ function Shell() {
   const displayUser = user
     ? { name: user.name, role: ROLE_LABELS[user.role], initials: userInitials(user.name, user.email) }
     : currentUser;
-  const { notify } = useToast();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
@@ -174,6 +175,7 @@ function Shell() {
     if (path === "/reports") return <Reports />;
     if (path === "/configuration") return <Configuration />;
     if (path === "/users") return <UserManagement />;
+    if (path === "/profile") return <Profile />;
     return (
       <div className="missing-state">
         <h2>Page not found</h2>
@@ -190,6 +192,7 @@ function Shell() {
   };
 
   const breadcrumbLabel = (() => {
+    if (path === "/profile") return "Profile";
     if (caseMatch) return "Case file";
     if (visitMatch) return "Visit capture";
     if (path === "/intake" || intakeMatch) return "New intake";
@@ -243,11 +246,11 @@ function Shell() {
         </button>
         <button type="button" className="nav-item" title={sidebarCollapsed ? "Notifications" : undefined} aria-label="Notifications"><Bell size={17} strokeWidth={1.8} /><span>Notifications</span><em className="nav-alert">3</em></button>
         <div className="sidebar-bottom">
-          <div className="role-card" title={sidebarCollapsed ? `${displayUser.name} · ${displayUser.role}` : undefined}>
+          <button type="button" className="role-card role-card-button" onClick={() => navigate("/profile")} aria-label="Open profile" title={sidebarCollapsed ? `${displayUser.name} · ${displayUser.role}` : "Open profile"}>
             <div className="avatar">{displayUser.initials}</div>
             <div><strong>{displayUser.name}</strong><span>{displayUser.role}</span></div>
             <MoreHorizontal className="role-menu-icon" size={16} />
-          </div>
+          </button>
           <div className="sidebar-footer">
             <span title={isOnline ? "Connected" : "Offline"}>{isOnline ? <><Wifi size={13} />Connected</> : <><WifiOff size={13} />Offline</>}</span>
             <span className="sidebar-version">v0.3 demo</span>
@@ -258,17 +261,26 @@ function Shell() {
       <div className="app-main">
         <header className="topbar">
           <div className="topbar-leading">
-            <button className="mobile-menu icon-button" type="button" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu size={19} /></button>
             <button
               className="sidebar-toggle icon-button"
               type="button"
-              onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
-              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-              aria-expanded={!sidebarCollapsed}
+              onClick={() => {
+                if (window.matchMedia("(max-width: 680px)").matches) {
+                  setMobileNavOpen((open) => !open);
+                } else {
+                  setSidebarCollapsed((collapsed) => !collapsed);
+                }
+              }}
+              aria-label={window.matchMedia("(max-width: 680px)").matches
+                ? (mobileNavOpen ? "Close navigation" : "Open navigation")
+                : (sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")}
+              aria-expanded={window.matchMedia("(max-width: 680px)").matches ? mobileNavOpen : !sidebarCollapsed}
               aria-controls="main-sidebar"
-              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              title={window.matchMedia("(max-width: 680px)").matches
+                ? (mobileNavOpen ? "Close navigation" : "Open navigation")
+                : (sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar")}
             >
-              {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+              <Menu size={19} />
             </button>
             <div className="breadcrumbs">
               <span>Ayavelisa</span><ArrowRight size={13} />
@@ -304,12 +316,8 @@ function Shell() {
               {databaseStatus === "connected" ? "Database saved" : databaseStatus === "saving" ? "Saving to database" : "Database issue · Retry"}
             </button>
             {supabase && (
-              <button type="button" className="topbar-user" aria-label="Sign out" title="Sign out"
-                onClick={() => {
-                  void supabase?.auth.signOut().then(({ error }) => {
-                    if (error) notify(`Could not sign out: ${error.message}`, "error");
-                  });
-                }}>
+              <button type="button" className="topbar-user" aria-label="Open profile" title="Open profile"
+                onClick={() => navigate("/profile")}>
                 <span className="avatar avatar-small">{displayUser.initials}</span>
                 <ChevronDown size={14} />
               </button>

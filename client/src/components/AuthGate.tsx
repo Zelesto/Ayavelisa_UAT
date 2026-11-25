@@ -3,8 +3,19 @@ import type { Session } from "@supabase/supabase-js";
 import { authorizedFetch, supabase } from "@/lib/supabase";
 import type { AuthenticatedUser } from "@/lib/auth";
 
-type AuthContextValue = { user: AuthenticatedUser | null; protectedMode: boolean };
-const AuthContext = createContext<AuthContextValue>({ user: null, protectedMode: false });
+type AuthContextValue = {
+  user: AuthenticatedUser | null;
+  protectedMode: boolean;
+  updateProfileName: (name: string) => Promise<void>;
+  changePassword: (password: string) => Promise<void>;
+};
+const unavailableAuthAction = async () => { throw new Error("Account access is not available."); };
+const AuthContext = createContext<AuthContextValue>({
+  user: null,
+  protectedMode: false,
+  updateProfileName: unavailableAuthAction,
+  changePassword: unavailableAuthAction,
+});
 
 export function useAuth() {
   return useContext(AuthContext);
@@ -34,6 +45,7 @@ export default function AuthGate({ children }: { children: ReactNode }) {
   const [recoveringPassword, setRecoveringPassword] = useState(false);
   const [newPassword, setNewPassword] = useState("");
   const [passwordUpdated, setPasswordUpdated] = useState(false);
+  const [resetEmailSent, setResetEmailSent] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -152,9 +164,47 @@ export default function AuthGate({ children }: { children: ReactNode }) {
     }
   };
 
+  const requestPasswordReset = async () => {
+    if (!supabase) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: window.location.origin,
+      });
+      if (resetError) throw resetError;
+      setResetEmailSent(true);
+    } catch (resetError) {
+      setError(resetError instanceof Error ? resetError.message : "Could not send a password reset email.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const updateProfileName = async (name: string) => {
+    const response = await authorizedFetch("/api/me", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const result = await readAccountResponse(response);
+    if (!response.ok || !result.user) {
+      throw new Error(result.error ?? "Could not update your profile.");
+    }
+    setUser(result.user);
+  };
+
+  const changePassword = async (nextPassword: string) => {
+    if (!supabase) throw new Error("Password management is not configured.");
+    const { error: passwordError } = await supabase.auth.updateUser({ password: nextPassword });
+    if (passwordError) throw passwordError;
+  };
+
+  const authValue: AuthContextValue = { user, protectedMode: true, updateProfileName, changePassword };
+
   if (!supabase) {
     if (import.meta.env.DEV) {
-      return <AuthContext.Provider value={{ user: null, protectedMode: false }}>{children}</AuthContext.Provider>;
+      return <AuthContext.Provider value={{ ...authValue, user: null, protectedMode: false }}>{children}</AuthContext.Provider>;
     }
     return (
       <main className="auth-page">
@@ -210,7 +260,7 @@ export default function AuthGate({ children }: { children: ReactNode }) {
 
   if (!session || !user) {
     return (
-      <AuthContext.Provider value={{ user: null, protectedMode: true }}>
+      <AuthContext.Provider value={{ ...authValue, user: null, protectedMode: true }}>
         <main className="auth-page">
           <section className="auth-card">
             <div className="brand-mark"><span>A</span><span>V</span></div>
@@ -229,8 +279,12 @@ export default function AuthGate({ children }: { children: ReactNode }) {
                   <input autoComplete="current-password" type="password" required value={password} onChange={(event) => setPassword(event.target.value)} />
                 </label>
                 {error && <p className="auth-error" role="alert">{error}</p>}
+                {resetEmailSent && <p className="user-admin-message user-admin-success" role="status">If this email belongs to an account, a password reset link has been sent.</p>}
                 <button type="submit" className="button button-primary full-width" disabled={submitting}>
                   {submitting ? "Signing in…" : "Sign in"}
+                </button>
+                <button type="button" className="text-button auth-reset-link" disabled={submitting || !email.trim()} onClick={() => void requestPasswordReset()}>
+                  {submitting ? "Sending…" : "Forgot password?"}
                 </button>
               </form>
             )}
@@ -247,5 +301,5 @@ export default function AuthGate({ children }: { children: ReactNode }) {
     );
   }
 
-  return <AuthContext.Provider value={{ user, protectedMode: true }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={authValue}>{children}</AuthContext.Provider>;
 }

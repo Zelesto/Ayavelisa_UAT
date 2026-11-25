@@ -30,6 +30,7 @@ model Branch {
   users      UserBranch[]
   cases      BranchCase[]
   appStates  AppState[]
+  configuration BranchConfiguration?
 }
 
 model UserBranch {
@@ -222,4 +223,16 @@ model AppState {
   updatedAt DateTime @updatedAt
 
   branch Branch? @relation(fields: [branchId], references: [id], onDelete: Cascade)
+}
+
+model BranchConfiguration {
+  id        String   @id
+  branchId  String   @unique
+  data      Json
+  version   Int      @default(1)
+  updatedBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
 }

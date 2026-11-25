@@ -55,6 +55,22 @@ async function ensureDefaultBranch() {
     create: { id: DEFAULT_BRANCH_ID, name: "Eastern Cape delivery" },
     update: {},
   });
+  await prisma.branchConfiguration.upsert({
+    where: { branchId: DEFAULT_BRANCH_ID },
+    create: {
+      id: `config-${DEFAULT_BRANCH_ID}`,
+      branchId: DEFAULT_BRANCH_ID,
+      data: {
+        title: "Individual subsidy",
+        version: "2.3",
+        effectiveOn: "2026-10-01",
+        owner: "Ayavelisa programme lead",
+        eligibilityRules: [],
+      },
+      updatedBy: "system",
+    },
+    update: {},
+  });
   await prisma.appState.updateMany({
     where: { id: STATE_ID, branchId: null },
     data: { branchId: DEFAULT_BRANCH_ID },
@@ -93,6 +109,22 @@ if (process.env.NODE_ENV === "production" && (!supabase || bootstrapAdminEmails.
 const SaveStateBody = z.object({
   version: z.number().int().nonnegative(),
   state: z.record(z.string(), z.unknown()),
+});
+const BranchConfigurationBody = z.object({
+  version: z.number().int().nonnegative(),
+  data: z.object({
+    title: z.string().trim().min(2).max(160),
+    version: z.string().trim().min(1).max(40),
+    effectiveOn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    owner: z.string().trim().min(2).max(120),
+    eligibilityRules: z.array(z.object({
+      id: z.string().min(1).max(80),
+      label: z.string().trim().min(2).max(160),
+      description: z.string().trim().max(1000),
+      required: z.boolean(),
+      evidenceTypes: z.array(z.string().trim().min(1).max(80)).max(12),
+    })).max(100),
+  }),
 });
 const WorkspaceCase = z.object({
   id: z.string().min(1),
@@ -490,7 +522,7 @@ app.addHook("preHandler", async (request, reply) => {
 
 app.addHook("preHandler", async (request, reply) => {
   const route = request.url.split("?")[0];
-  if (route !== "/api/state" && route !== "/api/overview" && route !== "/api/visits" && !route.startsWith("/api/visits/")) return;
+  if (route !== "/api/state" && route !== "/api/overview" && route !== "/api/configuration" && route !== "/api/visits" && !route.startsWith("/api/visits/")) return;
   const branchHeader = request.headers["x-branch-id"];
   const branchId = Array.isArray(branchHeader) ? branchHeader[0] : branchHeader;
   if (!branchId) return reply.code(400).send({ error: "branch_selection_required" });
@@ -539,6 +571,77 @@ app.get("/api/me", async (request, reply) => {
   return { user: request.authUser };
 });
 
+app.patch("/api/me", async (request, reply) => {
+  const actor = request.authUser;
+  if (!actor) return reply.code(401).send({ error: "unauthorized" });
+  const parsed = z.object({ name: z.string().trim().min(2).max(120) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "invalid_profile", issues: parsed.error.issues });
+  const updated = await prisma.user.update({
+    where: { id: actor.id },
+    data: { name: parsed.data.name },
+    select: { id: true, email: true, name: true, role: true },
+  });
+  const role = AccountRole.safeParse(updated.role);
+  if (!role.success) return reply.code(403).send({ error: "account_role_invalid" });
+  return { user: { ...updated, email: updated.email ?? actor.email, role: role.data } };
+});
+
+app.get("/api/configuration", async (request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  const configuration = await prisma.branchConfiguration.findUnique({
+    where: { branchId: request.branchId! },
+  });
+  return { data: configuration?.data ?? null, version: configuration?.version ?? 0 };
+});
+
+app.put("/api/configuration", async (request, reply) => {
+  const actor = request.authUser;
+  if (!actor) return reply.code(401).send({ error: "unauthorized" });
+  if (actor.role !== "admin" && actor.role !== "supervisor") {
+    return reply.code(403).send({ error: "configuration_edit_forbidden" });
+  }
+  const parsed = BranchConfigurationBody.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "invalid_configuration", issues: parsed.error.issues });
+
+  const branchId = request.branchId!;
+  const current = await prisma.branchConfiguration.findUnique({ where: { branchId } });
+  if ((current && current.version !== parsed.data.version) || (!current && parsed.data.version !== 0)) {
+    return reply.code(409).send({ error: "configuration_conflict", version: current?.version ?? 0 });
+  }
+
+  if (!current) {
+    try {
+      const created = await prisma.branchConfiguration.create({
+        data: {
+          id: crypto.randomUUID(),
+          branchId,
+          data: parsed.data.data,
+          version: 1,
+          updatedBy: actor.id,
+        },
+      });
+      return { data: created.data, version: created.version };
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const latest = await prisma.branchConfiguration.findUnique({ where: { branchId } });
+        return reply.code(409).send({ error: "configuration_conflict", version: latest?.version ?? 0 });
+      }
+      throw error;
+    }
+  }
+
+  const updated = await prisma.branchConfiguration.updateMany({
+    where: { branchId, version: parsed.data.version },
+    data: { data: parsed.data.data, version: { increment: 1 }, updatedBy: actor.id },
+  });
+  if (updated.count !== 1) {
+    const latest = await prisma.branchConfiguration.findUnique({ where: { branchId } });
+    return reply.code(409).send({ error: "configuration_conflict", version: latest?.version ?? 0 });
+  }
+  const saved = await prisma.branchConfiguration.findUniqueOrThrow({ where: { branchId } });
+  return { data: saved.data, version: saved.version };
+});
+
 app.get("/api/branches/mine", async (request, reply) => {
   reply.header("Cache-Control", "no-store");
   const actor = request.authUser;
@@ -583,6 +686,20 @@ app.post("/api/admin/branches", async (request, reply) => {
       const created = await transaction.branch.create({ data: { id, name } });
       await transaction.userBranch.create({
         data: { userId: actor.id, branchId: id, isDefault: !currentDefault },
+      });
+      await transaction.branchConfiguration.create({
+        data: {
+          id: `config-${id}`,
+          branchId: id,
+          data: {
+            title: "",
+            version: "1.0",
+            effectiveOn: "",
+            owner: actor.name,
+            eligibilityRules: [],
+          },
+          updatedBy: actor.id,
+        },
       });
       return created;
     });
