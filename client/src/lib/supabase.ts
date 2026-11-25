@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { attachActiveBranch } from "./branches";
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -27,6 +28,7 @@ export function attachDevelopmentPersona(headers: Headers) {
 export async function authorizedFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   attachDevelopmentPersona(headers);
+  attachActiveBranch(headers);
   if (supabase) {
     const { data, error } = await supabase.auth.getSession();
     if (error) throw error;

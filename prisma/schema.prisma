@@ -17,6 +17,43 @@ model User {
   persona   String   @default("fieldworker")
   createdAt DateTime @default(now())
   updatedAt DateTime @default(now()) @updatedAt
+
+  branchMemberships UserBranch[]
+}
+
+model Branch {
+  id        String   @id
+  name      String   @unique
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  users      UserBranch[]
+  cases      BranchCase[]
+  appStates  AppState[]
+}
+
+model UserBranch {
+  userId     String
+  branchId   String
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([userId, branchId])
+  @@index([branchId])
+}
+
+model BranchCase {
+  branchId String
+  caseId   String
+
+  branch Branch     @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  case   CaseRecord @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@id([branchId, caseId])
+  @@index([caseId])
 }
 
 model UserAudit {
@@ -52,12 +89,14 @@ model CaseRecord {
   intakeId           String?
   latestVisitSummary Json?
   version            Int      @default(1)
+  archivedAt         DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   visits     Visit[]
   blockers   Blocker[]
   activities Activity[]
+  branches   BranchCase[]
 }
 
 model Visit {
@@ -177,7 +216,10 @@ model Intake {
 
 model AppState {
   id        String   @id
+  branchId  String?  @unique
   data      Json
   version   Int      @default(1)
   updatedAt DateTime @updatedAt
+
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: Cascade)
 }

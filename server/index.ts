@@ -13,12 +13,13 @@ import { registerGeocodeRoutes } from "./routes/geocode.js";
 
 
 const prisma = new PrismaClient();
+const DEFAULT_BRANCH_ID = "eastern-cape-delivery";
+const STATE_ID = "workspace";
 const app = Fastify({
   logger: true,
   bodyLimit: 50 * 1024 * 1024,
   trustProxy: process.env.TRUST_PROXY === "true",
 });
-const STATE_ID = "workspace";
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 const bootstrapAdminEmails = new Set(
@@ -48,9 +49,40 @@ type AuthenticatedUser = {
   role: AccountRole;
 };
 
+async function ensureDefaultBranch() {
+  await prisma.branch.upsert({
+    where: { id: DEFAULT_BRANCH_ID },
+    create: { id: DEFAULT_BRANCH_ID, name: "Eastern Cape delivery" },
+    update: {},
+  });
+  await prisma.appState.updateMany({
+    where: { id: STATE_ID, branchId: null },
+    data: { branchId: DEFAULT_BRANCH_ID },
+  });
+
+  const users = await prisma.user.findMany({
+    select: { id: true, branchMemberships: { select: { branchId: true, isDefault: true } } },
+  });
+  for (const user of users) {
+    if (user.branchMemberships.length === 0) {
+      await prisma.userBranch.create({
+        data: { userId: user.id, branchId: DEFAULT_BRANCH_ID, isDefault: true },
+      });
+    } else if (!user.branchMemberships.some((membership) => membership.isDefault)) {
+      await prisma.userBranch.update({
+        where: { userId_branchId: { userId: user.id, branchId: user.branchMemberships[0].branchId } },
+        data: { isDefault: true },
+      });
+    }
+  }
+}
+
+await ensureDefaultBranch();
+
 declare module "fastify" {
   interface FastifyRequest {
     authUser: AuthenticatedUser | null;
+    branchId: string | null;
   }
 }
 
@@ -81,6 +113,7 @@ const WorkspaceCase = z.object({
   sources: z.array(z.record(z.string(), z.unknown())).optional(),
   intakeId: z.string().nullable().optional(),
   latestVisitSummary: z.record(z.string(), z.unknown()).nullable().optional(),
+  archivedAt: z.string().datetime().nullable().optional(),
 });
 const WorkspaceVisit = z.object({
   id: z.string().min(1),
@@ -98,15 +131,31 @@ const WorkspaceVisit = z.object({
   reviewedBy: z.string().nullable().optional(),
   synced: z.boolean().optional(),
 });
+const WorkspaceBlocker = z.object({
+  id: z.string().min(1),
+  label: z.string(),
+  detail: z.string(),
+  action: z.string(),
+  primary: z.enum(["request", "assign"]),
+  status: z.enum(["open", "requested", "assigned", "resolved"]),
+});
 const InviteUserBody = z.object({
   email: z.string().trim().email().max(254),
   name: z.string().trim().min(1).max(120).optional(),
   role: AccountRole,
-});
+  branchIds: z.array(z.string().min(1)).min(1).optional(),
+  defaultBranchId: z.string().min(1).optional(),
+}).refine((value) =>
+  value.defaultBranchId === undefined || value.branchIds?.includes(value.defaultBranchId) === true,
+);
 const UpdateUserBody = z.object({
   role: AccountRole.optional(),
   active: z.boolean().optional(),
-}).refine((value) => value.role !== undefined || value.active !== undefined);
+  branchIds: z.array(z.string().min(1)).min(1).optional(),
+  defaultBranchId: z.string().min(1).optional(),
+}).refine((value) =>
+  value.role !== undefined || value.active !== undefined || value.branchIds !== undefined || value.defaultBranchId !== undefined,
+).refine((value) => value.defaultBranchId === undefined || value.branchIds?.includes(value.defaultBranchId) === true);
 
 const editableStateKeys: Record<AccountRole, ReadonlySet<string> | null> = {
   admin: null,
@@ -135,6 +184,7 @@ function localDevelopmentUser(personaHeader: string | string[] | undefined): Aut
 async function syncWorkspaceEntities(
   transaction: Prisma.TransactionClient,
   state: Record<string, unknown>,
+  branchId: string,
 ) {
   const parsedCases = z.array(WorkspaceCase).safeParse(state.cases ?? []);
   if (!parsedCases.success) {
@@ -156,31 +206,114 @@ async function syncWorkspaceEntities(
     where: { id: { in: [...caseIds] } },
     select: { id: true },
   })).map((record) => record.id));
-  const newCases = cases.filter((record) => !existingCases.has(record.id));
+  const branchCases = await transaction.branchCase.findMany({
+    where: { caseId: { in: [...caseIds] } },
+    select: { caseId: true, branchId: true },
+  });
+  const crossBranchCase = branchCases.find((record) => record.branchId !== branchId);
+  if (crossBranchCase) {
+    throw Object.assign(new Error("case_id_in_another_branch"), {
+      statusCode: 409, code: "case_id_in_another_branch", field: crossBranchCase.caseId,
+    });
+  }
+  if (branchCases.length === 0 && branchId !== DEFAULT_BRANCH_ID) {
+    const unassignedExistingCase = cases.find((record) => existingCases.has(record.id));
+    if (unassignedExistingCase) {
+      throw Object.assign(new Error("case_id_in_another_branch"), {
+        statusCode: 409, code: "case_id_in_another_branch", field: unassignedExistingCase.id,
+      });
+    }
+  }
 
-  if (newCases.length > 0) {
-    await transaction.caseRecord.createMany({
+  for (const record of cases) {
+    const caseData = {
+      name: record.name,
+      household: record.household,
+      project: record.project,
+      location: record.location,
+      source: record.source,
+      verification: record.verification,
+      verificationTone: record.verificationTone,
+      subsidy: record.subsidy,
+      subsidyTone: record.subsidyTone,
+      readiness: record.readiness,
+      nextAction: record.nextAction,
+      updated: record.updated,
+      members: record.members,
+      site: record.site,
+      sources: record.sources as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
+      intakeId: record.intakeId ?? null,
+      latestVisitSummary: record.latestVisitSummary as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
+      archivedAt: record.archivedAt ? new Date(record.archivedAt) : null,
+    };
+    await transaction.caseRecord.upsert({
+      where: { id: record.id },
+      create: { id: record.id, ...caseData },
+      update: caseData,
+    });
+  }
+
+  if (cases.length > 0) {
+    await transaction.branchCase.createMany({
       skipDuplicates: true,
-      data: newCases.map((record) => ({
-        id: record.id,
-        name: record.name,
-        household: record.household,
-        project: record.project,
-        location: record.location,
-        source: record.source,
-        verification: record.verification,
-        verificationTone: record.verificationTone,
-        subsidy: record.subsidy,
-        subsidyTone: record.subsidyTone,
-        readiness: record.readiness,
-        nextAction: record.nextAction,
-        updated: record.updated,
-        members: record.members,
-        site: record.site,
-        sources: record.sources as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
-        intakeId: record.intakeId ?? null,
-        latestVisitSummary: record.latestVisitSummary as Prisma.InputJsonValue | undefined ?? Prisma.DbNull,
-      })),
+      data: cases.map((record) => ({ branchId, caseId: record.id })),
+    });
+  }
+  await transaction.branchCase.deleteMany({
+    where: {
+      branchId,
+      ...(caseIds.size > 0 ? { caseId: { notIn: [...caseIds] } } : {}),
+    },
+  });
+
+  const rawBlockers = state.blockers && typeof state.blockers === "object" && !Array.isArray(state.blockers)
+    ? state.blockers as Record<string, unknown>
+    : {};
+  const parsedBlockers: Array<z.infer<typeof WorkspaceBlocker> & { caseId: string }> = [];
+  for (const [caseId, rawList] of Object.entries(rawBlockers)) {
+    if (!caseIds.has(caseId)) continue;
+    const parsedList = z.array(WorkspaceBlocker).safeParse(rawList);
+    if (!parsedList.success) {
+      throw Object.assign(new Error("invalid_workspace_blockers"), {
+        statusCode: 400, code: "invalid_workspace_blockers", field: caseId, issues: parsedList.error.issues,
+      });
+    }
+    parsedBlockers.push(...parsedList.data.map((record) => ({ ...record, caseId })));
+  }
+  const blockerIds = [...new Set(parsedBlockers.map((blocker) => blocker.id))];
+  const existingBlockers = blockerIds.length
+    ? await transaction.blocker.findMany({
+        where: { id: { in: blockerIds } },
+        select: { id: true, caseId: true },
+      })
+    : [];
+  const conflictingBlocker = existingBlockers.find((existing) =>
+    parsedBlockers.find((blocker) => blocker.id === existing.id)?.caseId !== existing.caseId,
+  );
+  if (conflictingBlocker) {
+    throw Object.assign(new Error("blocker_id_in_use"), {
+      statusCode: 409, code: "blocker_id_in_use", field: conflictingBlocker.id,
+    });
+  }
+  for (const blocker of parsedBlockers) {
+    await transaction.blocker.upsert({
+      where: { id: blocker.id },
+      create: blocker,
+      update: {
+        label: blocker.label,
+        detail: blocker.detail,
+        action: blocker.action,
+        primary: blocker.primary,
+        status: blocker.status,
+      },
+    });
+  }
+  if (caseIds.size > 0) {
+    await transaction.blocker.deleteMany({
+      where: {
+        caseId: { in: [...caseIds] },
+        ...(blockerIds.length > 0 ? { id: { notIn: blockerIds } } : {}),
+      },
     });
   }
 
@@ -284,6 +417,7 @@ app.setErrorHandler((error, request, reply) => {
 });
 
 app.decorateRequest("authUser", null);
+app.decorateRequest("branchId", null);
 app.addHook("preHandler", async (request, reply) => {
   const route = request.url.split("?")[0];
   if (!route.startsWith("/api/") || route === "/api/health") return;
@@ -333,6 +467,14 @@ app.addHook("preHandler", async (request, reply) => {
     return reply.code(403).send({ error: "account_not_invited" });
   }
   if (!account.active) return reply.code(403).send({ error: "account_inactive" });
+  if (bootstrapAdminEmails.has(email) && account.role === "admin") {
+    const membershipCount = await prisma.userBranch.count({ where: { userId: account.id } });
+    if (membershipCount === 0) {
+      await prisma.userBranch.create({
+        data: { userId: account.id, branchId: DEFAULT_BRANCH_ID, isDefault: true },
+      });
+    }
+  }
   const role = AccountRole.safeParse(account.role);
   if (!role.success) {
     request.log.error({ userId: account.id }, "Account has an unsupported role");
@@ -344,6 +486,25 @@ app.addHook("preHandler", async (request, reply) => {
     name: account.name,
     role: role.data,
   };
+});
+
+app.addHook("preHandler", async (request, reply) => {
+  const route = request.url.split("?")[0];
+  if (route !== "/api/state" && route !== "/api/overview" && route !== "/api/visits" && !route.startsWith("/api/visits/")) return;
+  const branchHeader = request.headers["x-branch-id"];
+  const branchId = Array.isArray(branchHeader) ? branchHeader[0] : branchHeader;
+  if (!branchId) return reply.code(400).send({ error: "branch_selection_required" });
+  const branch = await prisma.branch.findUnique({ where: { id: branchId }, select: { id: true, active: true } });
+  if (!branch?.active) return reply.code(404).send({ error: "branch_not_found" });
+  const isLocalDemoUser = request.authUser?.email.endsWith("@local.ayavelisa.test") ?? false;
+  if (!isLocalDemoUser) {
+    const membership = await prisma.userBranch.findUnique({
+      where: { userId_branchId: { userId: request.authUser!.id, branchId } },
+      select: { userId: true },
+    });
+    if (!membership) return reply.code(403).send({ error: "branch_access_denied" });
+  }
+  request.branchId = branchId;
 });
 
 app.get("/api/health", async (request, reply) => {
@@ -378,6 +539,86 @@ app.get("/api/me", async (request, reply) => {
   return { user: request.authUser };
 });
 
+app.get("/api/branches/mine", async (request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  const actor = request.authUser;
+  if (!actor) return reply.code(401).send({ error: "unauthorized" });
+  const memberships = actor.email.endsWith("@local.ayavelisa.test")
+    ? await prisma.branch.findMany({ where: { active: true }, orderBy: { name: "asc" } })
+    : (await prisma.userBranch.findMany({
+        where: { userId: actor.id, branch: { active: true } },
+        include: { branch: true },
+        orderBy: [{ isDefault: "desc" }, { branch: { name: "asc" } }],
+      })).map((membership) => ({ ...membership.branch, isDefault: membership.isDefault }));
+  if (!memberships.length) return reply.code(403).send({ error: "no_branches_assigned" });
+  return {
+    branches: memberships.map((branch) => ({
+      id: branch.id,
+      name: branch.name,
+      isDefault: "isDefault" in branch ? branch.isDefault : branch.id === DEFAULT_BRANCH_ID,
+    })),
+  };
+});
+
+app.get("/api/admin/branches", async (request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  if (request.authUser?.role !== "admin") return reply.code(403).send({ error: "admin_required" });
+  const branches = await prisma.branch.findMany({ where: { active: true }, orderBy: { name: "asc" } });
+  return { branches };
+});
+
+app.post("/api/admin/branches", async (request, reply) => {
+  const actor = request.authUser;
+  if (actor?.role !== "admin") return reply.code(403).send({ error: "admin_required" });
+  const parsed = z.object({ name: z.string().trim().min(2).max(120) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "invalid_branch", issues: parsed.error.issues });
+  const name = parsed.data.name;
+  const id = crypto.randomUUID();
+  try {
+    const branch = await prisma.$transaction(async (transaction) => {
+      const currentDefault = await transaction.userBranch.findFirst({
+        where: { userId: actor.id, isDefault: true },
+        select: { branchId: true },
+      });
+      const created = await transaction.branch.create({ data: { id, name } });
+      await transaction.userBranch.create({
+        data: { userId: actor.id, branchId: id, isDefault: !currentDefault },
+      });
+      return created;
+    });
+    return reply.code(201).send({ branch });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      return reply.code(409).send({ error: "branch_name_already_exists" });
+    }
+    request.log.error({ err: error }, "Could not create branch");
+    return reply.code(500).send({ error: "branch_creation_failed" });
+  }
+});
+
+app.patch<{ Params: { id: string } }>("/api/admin/branches/:id", async (request, reply) => {
+  const actor = request.authUser;
+  if (actor?.role !== "admin") return reply.code(403).send({ error: "admin_required" });
+  const parsed = z.object({ name: z.string().trim().min(2).max(120) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "invalid_branch", issues: parsed.error.issues });
+  try {
+    const branch = await prisma.branch.update({
+      where: { id: request.params.id },
+      data: { name: parsed.data.name },
+    });
+    return { branch };
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      return reply.code(409).send({ error: "branch_name_already_exists" });
+    }
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+      return reply.code(404).send({ error: "branch_not_found" });
+    }
+    request.log.error({ err: error, branchId: request.params.id }, "Could not update branch");
+    return reply.code(500).send({ error: "branch_update_failed" });
+  }
+});
+
 app.get("/api/admin/users", async (request, reply) => {
   reply.header("Cache-Control", "no-store");
   if (request.authUser?.role !== "admin") {
@@ -386,9 +627,22 @@ app.get("/api/admin/users", async (request, reply) => {
   const users = await prisma.user.findMany({
     where: { email: { not: null } },
     orderBy: { createdAt: "desc" },
-    select: { id: true, email: true, name: true, role: true, active: true, createdAt: true },
+    select: {
+      id: true, email: true, name: true, role: true, active: true, createdAt: true,
+      branchMemberships: {
+        where: { branch: { active: true } },
+        select: { branchId: true, isDefault: true, branch: { select: { name: true } } },
+      },
+    },
   });
-  return { users };
+  return {
+    users: users.map(({ branchMemberships, ...user }) => ({
+      ...user,
+      branchIds: branchMemberships.map((membership) => membership.branchId),
+      defaultBranchId: branchMemberships.find((membership) => membership.isDefault)?.branchId ?? null,
+      branches: branchMemberships.map((membership) => ({ id: membership.branchId, name: membership.branch.name })),
+    })),
+  };
 });
 
 async function findSupabaseUserByEmail(email: string) {
@@ -413,6 +667,8 @@ async function createManagedUser(
   email: string,
   name: string | undefined,
   role: AccountRole,
+  branchIds: string[],
+  defaultBranchId: string,
   action: "invite" | "link_existing",
 ) {
   return prisma.$transaction(async (transaction) => {
@@ -426,6 +682,13 @@ async function createManagedUser(
       },
       select: { id: true, email: true, name: true, role: true, active: true, createdAt: true },
     });
+    await transaction.userBranch.createMany({
+        data: branchIds.map((branchId) => ({
+          userId: created.id,
+          branchId,
+          isDefault: branchId === defaultBranchId,
+        })),
+    });
     await transaction.userAudit.create({
       data: {
         id: crypto.randomUUID(),
@@ -435,7 +698,11 @@ async function createManagedUser(
         after: { id: created.id, email: created.email, name: created.name, role: created.role, active: created.active },
       },
     });
-    return created;
+    return {
+      ...created,
+      branchIds,
+      defaultBranchId,
+    };
   });
 }
 
@@ -449,6 +716,13 @@ app.post("/api/admin/users", async (request, reply) => {
   if (!supabaseAdmin) return reply.code(503).send({ error: "user_invites_unavailable" });
 
   const email = parsed.data.email.toLowerCase();
+  const branchIds = [...new Set(parsed.data.branchIds ?? [
+    (request.headers["x-branch-id"] as string | undefined) ?? DEFAULT_BRANCH_ID,
+  ])];
+  const defaultBranchId = parsed.data.defaultBranchId ?? branchIds[0];
+  if (!branchIds.includes(defaultBranchId)) return reply.code(400).send({ error: "default_branch_must_be_assigned" });
+  const activeBranches = await prisma.branch.count({ where: { id: { in: branchIds }, active: true } });
+  if (activeBranches !== branchIds.length) return reply.code(400).send({ error: "invalid_branch_assignment" });
   const existing = await prisma.user.findFirst({ where: { email } });
   if (existing) return reply.code(409).send({ error: "account_already_managed" });
 
@@ -462,7 +736,7 @@ app.post("/api/admin/users", async (request, reply) => {
 
   if (existingAuthUser?.id) {
     try {
-      const user = await createManagedUser(actor, existingAuthUser, email, parsed.data.name, parsed.data.role, "link_existing");
+      const user = await createManagedUser(actor, existingAuthUser, email, parsed.data.name, parsed.data.role, branchIds, defaultBranchId, "link_existing");
       return reply.code(201).send({ user, linkedExisting: true });
     } catch (linkError) {
       request.log.error({ err: linkError, authUserId: existingAuthUser.id }, "Could not link existing Supabase account");
@@ -484,7 +758,7 @@ app.post("/api/admin/users", async (request, reply) => {
   }
 
   try {
-    const user = await createManagedUser(actor, data.user, email, parsed.data.name, parsed.data.role, "invite");
+    const user = await createManagedUser(actor, data.user, email, parsed.data.name, parsed.data.role, branchIds, defaultBranchId, "invite");
     return reply.code(201).send({ user });
   } catch (error) {
     request.log.error({ err: error, invitedUserId: data.user.id }, "Invite sent but account setup failed");
@@ -548,6 +822,11 @@ app.patch<{ Params: { id: string } }>("/api/admin/users/:id", async (request, re
   if (request.params.id === actor.id && (parsed.data.active === false || parsed.data.role !== undefined && parsed.data.role !== "admin")) {
     return reply.code(400).send({ error: "cannot_remove_own_admin_access" });
   }
+  const requestedBranchIds = parsed.data.branchIds ? [...new Set(parsed.data.branchIds)] : null;
+  if (requestedBranchIds) {
+    const activeBranches = await prisma.branch.count({ where: { id: { in: requestedBranchIds }, active: true } });
+    if (activeBranches !== requestedBranchIds.length) return reply.code(400).send({ error: "invalid_branch_assignment" });
+  }
 
   let accountToActivate: { id: string; email: string | null } | null = null;
   if (parsed.data.active === true) {
@@ -597,6 +876,16 @@ app.patch<{ Params: { id: string } }>("/api/admin/users/:id", async (request, re
       await transaction.$queryRaw`SELECT 1 FROM (SELECT pg_advisory_xact_lock(78112026)) AS account_lock`;
       const current = await transaction.user.findUnique({ where: { id: request.params.id } });
       if (!current?.email) return null;
+      const currentMemberships = await transaction.userBranch.findMany({
+        where: { userId: current.id },
+        select: { branchId: true, isDefault: true },
+      });
+      const branchIds = requestedBranchIds ?? currentMemberships.map((membership) => membership.branchId);
+      if (branchIds.length === 0) throw new Error("branch_assignment_required");
+      const defaultBranchId = parsed.data.defaultBranchId
+        ?? currentMemberships.find((membership) => membership.isDefault && branchIds.includes(membership.branchId))?.branchId
+        ?? branchIds[0];
+      if (!branchIds.includes(defaultBranchId)) throw new Error("default_branch_must_be_assigned");
 
       const nextRole = parsed.data.role ?? current.role;
       const nextActive = parsed.data.active ?? current.active;
@@ -612,6 +901,16 @@ app.patch<{ Params: { id: string } }>("/api/admin/users/:id", async (request, re
         data: { role: nextRole, active: nextActive },
         select: { id: true, email: true, name: true, role: true, active: true, createdAt: true },
       });
+      if (requestedBranchIds) {
+        await transaction.userBranch.deleteMany({ where: { userId: current.id } });
+        await transaction.userBranch.createMany({
+          data: branchIds.map((branchId) => ({
+            userId: current.id,
+            branchId,
+            isDefault: branchId === defaultBranchId,
+          })),
+        });
+      }
       await transaction.userAudit.create({
         data: {
           id: crypto.randomUUID(),
@@ -626,13 +925,20 @@ app.patch<{ Params: { id: string } }>("/api/admin/users/:id", async (request, re
           },
         },
       });
-      return updated;
+      return {
+        ...updated,
+        branchIds,
+        defaultBranchId,
+      };
     });
     if (!updatedUser) return reply.code(404).send({ error: "account_not_found" });
     return { user: updatedUser, ...(parsed.data.active === true ? { loginAllowed: true } : {}) };
   } catch (error) {
     if (error instanceof Error && error.message === "last_active_admin") {
       return reply.code(409).send({ error: "cannot_remove_last_active_admin" });
+    }
+    if (error instanceof Error && error.message === "branch_assignment_required") {
+      return reply.code(409).send({ error: "branch_assignment_required" });
     }
     request.log.error({ err: error }, "Could not update account");
     return reply.code(503).send({ error: "account_update_failed" });
@@ -707,12 +1013,105 @@ await registerGeocodeRoutes(app);
 
 /* --- Whole-workspace state (still used by the untouched pages) ----------- */
 
-app.get("/api/state", async (_request, reply) => {
+app.get("/api/overview", async (request, reply) => {
   reply.header("Cache-Control", "no-store");
-  const saved = await prisma.appState.findUnique({ where: { id: STATE_ID } });
+  const branchId = request.branchId!;
+  const [branch, saved, visitsByStatus, caseRecords, openBlockerCount] = await Promise.all([
+    prisma.branch.findUnique({ where: { id: branchId }, select: { id: true, name: true } }),
+    prisma.appState.findUnique({ where: { branchId } }),
+    prisma.visit.groupBy({
+      by: ["status"],
+      where: { case: { branches: { some: { branchId } } } },
+      _count: { _all: true },
+    }),
+    prisma.caseRecord.findMany({
+      where: { branches: { some: { branchId } }, archivedAt: null },
+      select: { id: true, name: true, project: true, location: true, verification: true, subsidy: true, readiness: true, nextAction: true, updated: true },
+      orderBy: { updatedAt: "desc" },
+    }),
+    prisma.blocker.count({
+      where: { status: { not: "resolved" }, case: { branches: { some: { branchId } }, archivedAt: null } },
+    }),
+  ]);
+  const state = saved?.data && typeof saved.data === "object" && !Array.isArray(saved.data)
+    ? saved.data as Record<string, unknown>
+    : {};
+  const activeCases = caseRecords;
+  const visitCounts = Object.fromEntries(visitsByStatus.map((row) => [row.status, row._count._all]));
+  const projectCounts = new Map<string, { name: string; cases: number; location: string; verified: number; subsidyApproved: number; ready: number }>();
+  for (const record of activeCases) {
+    const name = typeof record.project === "string" && record.project ? record.project : "Unassigned project";
+    const current = projectCounts.get(name) ?? {
+      name, cases: 0, location: typeof record.location === "string" ? record.location : "",
+      verified: 0, subsidyApproved: 0, ready: 0,
+    };
+    current.cases += 1;
+    if (/verified/i.test(String(record.verification ?? ""))) current.verified += 1;
+    if (/approved/i.test(String(record.subsidy ?? ""))) current.subsidyApproved += 1;
+    if (/ready for works/i.test(String(record.readiness ?? ""))) current.ready += 1;
+    projectCounts.set(name, current);
+  }
+  const projects = [...projectCounts.values()].sort((a, b) => b.cases - a.cases).slice(0, 3);
+  const actions = activeCases
+    .filter((record) =>
+      (typeof record.nextAction === "string" && record.nextAction && record.nextAction !== "Confirm builder pack")
+      || /blocked|exception/i.test(String(record.readiness ?? "")),
+    )
+    .slice(0, 5)
+    .map((record) => ({
+      id: String(record.id ?? ""),
+      name: String(record.name ?? ""),
+      nextAction: String(record.nextAction ?? "Review case"),
+      readiness: String(record.readiness ?? ""),
+      updated: String(record.updated ?? ""),
+    }));
+  const recentActivities = Array.isArray(state.activities) ? state.activities.slice(0, 5) : [];
+  const syncState = state.sync && typeof state.sync === "object" && !Array.isArray(state.sync)
+    ? state.sync as Record<string, unknown>
+    : {};
+  const activityRows = recentActivities.length > 0
+    ? recentActivities
+    : await prisma.activity.findMany({
+        where: { case: { branches: { some: { branchId } } } },
+        orderBy: { at: "desc" },
+        take: 5,
+      });
+
+  return {
+    branch,
+    counts: {
+      households: activeCases.length,
+      inFlight: activeCases.filter((record) => !/ready for works/i.test(String(record.readiness ?? ""))).length,
+      completedVisits: visitCounts.approved ?? 0,
+      exceptions: openBlockerCount + activeCases.filter((record) => /blocked|exception/i.test(String(record.readiness ?? ""))).length,
+      totalVisits: Object.values(visitCounts).reduce((sum, count) => sum + count, 0),
+      verified: activeCases.filter((record) => /verified/i.test(String(record.verification ?? ""))).length,
+      subsidyApproved: activeCases.filter((record) => /approved/i.test(String(record.subsidy ?? ""))).length,
+      ready: activeCases.filter((record) => /ready for works/i.test(String(record.readiness ?? ""))).length,
+      needsAttention: activeCases.filter((record) => /blocked|exception/i.test(String(record.readiness ?? ""))).length,
+    },
+    projects,
+    actions,
+    activities: activityRows.map((activity) => {
+      if ("at" in activity && activity.at instanceof Date) {
+        return { ...activity, at: activity.at.toISOString() };
+      }
+      return activity;
+    }),
+    sync: {
+      pendingUploads: typeof syncState.pendingUploads === "number" ? syncState.pendingUploads : 0,
+      lastSync: typeof syncState.lastSync === "string" ? syncState.lastSync : null,
+    },
+  };
+});
+
+app.get("/api/state", async (request, reply) => {
+  reply.header("Cache-Control", "no-store");
+  const branchId = request.branchId!;
+  const saved = await prisma.appState.findUnique({ where: { branchId } });
   if (!saved) return { state: null, version: 0 };
   await prisma.$transaction((transaction) =>
-    syncWorkspaceEntities(transaction, saved.data as Record<string, unknown>),
+    syncWorkspaceEntities(transaction, saved.data as Record<string, unknown>, branchId),
   );
   return { state: saved.data, version: saved.version };
 });
@@ -724,12 +1123,10 @@ app.put("/api/state", async (request, reply) => {
     return reply.code(400).send({ error: "invalid_state", issues: parsed.error.issues });
   }
 
-  const current = await prisma.appState.findUnique({ where: { id: STATE_ID } });
+  const branchId = request.branchId!;
+  const current = await prisma.appState.findUnique({ where: { branchId } });
   const isLocalDemoUser = request.authUser?.email.endsWith("@local.ayavelisa.test") ?? false;
   const role = isLocalDemoUser ? undefined : request.authUser?.role;
-  if (role && !current && role !== "admin" && role !== "supervisor") {
-    return reply.code(403).send({ error: "workspace_initialization_requires_supervisor" });
-  }
   const editableKeys = role ? editableStateKeys[role] : null;
   if (current && editableKeys) {
     const previousState = current.data as Record<string, unknown>;
@@ -752,15 +1149,15 @@ app.put("/api/state", async (request, reply) => {
     try {
       const created = await prisma.$transaction(async (transaction) => {
         const saved = await transaction.appState.create({
-          data: { id: STATE_ID, data: parsed.data.state as Prisma.InputJsonValue, version: 1 },
+          data: { id: branchId, branchId, data: parsed.data.state as Prisma.InputJsonValue, version: 1 },
         });
-        await syncWorkspaceEntities(transaction, parsed.data.state);
+        await syncWorkspaceEntities(transaction, parsed.data.state, branchId);
         return saved;
       });
       return { version: created.version };
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-        const latest = await prisma.appState.findUnique({ where: { id: STATE_ID } });
+        const latest = await prisma.appState.findUnique({ where: { branchId } });
         return reply.code(409).send({ error: "state_conflict", version: latest?.version ?? 0 });
       }
       throw error;
@@ -769,18 +1166,18 @@ app.put("/api/state", async (request, reply) => {
 
   const updatedVersion = await prisma.$transaction(async (transaction) => {
     const updated = await transaction.appState.updateMany({
-      where: { id: STATE_ID, version: parsed.data.version },
+      where: { branchId, version: parsed.data.version },
       data: {
         data: parsed.data.state as Prisma.InputJsonValue,
         version: { increment: 1 },
       },
     });
     if (updated.count !== 1) return null;
-    await syncWorkspaceEntities(transaction, parsed.data.state);
+    await syncWorkspaceEntities(transaction, parsed.data.state, branchId);
     return parsed.data.version + 1;
   });
   if (updatedVersion === null) {
-    const latest = await prisma.appState.findUnique({ where: { id: STATE_ID } });
+    const latest = await prisma.appState.findUnique({ where: { branchId } });
     return reply.code(409).send({ error: "state_conflict", version: latest?.version ?? 0 });
   }
   return { version: updatedVersion };

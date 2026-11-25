@@ -9,6 +9,7 @@
    ========================================================================= */
 
 import { attachDevelopmentPersona, supabase } from "./supabase";
+import { attachActiveBranch } from "./branches";
 
 export class ApiError extends Error {
   constructor(
@@ -104,6 +105,7 @@ async function parseError(response: Response): Promise<ApiError> {
 async function doFetch(path: string, init: ApiFetchInit, forceRefresh: boolean): Promise<Response> {
   const headers = new Headers(init.headers);
   attachDevelopmentPersona(headers);
+  attachActiveBranch(headers);
   const token = await getAccessToken(forceRefresh);
   if (token) headers.set("Authorization", `Bearer ${token}`);
 

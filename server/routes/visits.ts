@@ -173,9 +173,10 @@ async function loadVisitForWrite(
   prisma: PrismaClient,
   visitId: string,
   actor: { id: string; name: string; role: string },
+  branchId: string,
 ) {
-  const visit = await prisma.visit.findUnique({
-    where: { id: visitId },
+  const visit = await prisma.visit.findFirst({
+    where: { id: visitId, case: { branches: { some: { branchId } } } },
     include: { case: { select: { id: true, project: true } } },
   });
   if (!visit) {
@@ -222,7 +223,7 @@ export async function registerVisitRoutes(
       limit: z.coerce.number().int().min(1).max(200).default(100),
     }).parse(request.query);
 
-    const where: Prisma.VisitWhereInput = {};
+    const where: Prisma.VisitWhereInput = { case: { branches: { some: { branchId: request.branchId! } } } };
     if (query.caseId) where.caseId = query.caseId;
     if (query.status) where.status = query.status;
     if (query.from || query.to) {
@@ -247,8 +248,8 @@ export async function registerVisitRoutes(
     const actor = request.authUser;
     if (!actor) return reply.code(401).send({ error: "unauthorized" });
 
-    const visit = await prisma.visit.findUnique({
-      where: { id: request.params.id },
+    const visit = await prisma.visit.findFirst({
+      where: { id: request.params.id, case: { branches: { some: { branchId: request.branchId! } } } },
       include: { evidence: true, grievances: true },
     });
     if (!visit) return reply.code(404).send({ error: "visit_not_found" });
@@ -267,7 +268,7 @@ export async function registerVisitRoutes(
     if (!parsed.success) {
       return reply.code(400).send({ error: "invalid_visit_patch", issues: parsed.error.issues });
     }
-    const visit = await loadVisitForWrite(prisma, request.params.id, actor);
+    const visit = await loadVisitForWrite(prisma, request.params.id, actor, request.branchId!);
     if (visit.status === "approved" || visit.status === "captured") {
       return reply.code(409).send({ error: "visit_not_editable", status: visit.status });
     }
@@ -299,7 +300,7 @@ export async function registerVisitRoutes(
       return reply.code(503).send({ error: "evidence_storage_unavailable" });
     }
 
-    const visit = await loadVisitForWrite(prisma, request.params.id, actor);
+    const visit = await loadVisitForWrite(prisma, request.params.id, actor, request.branchId!);
     if (visit.status === "approved") {
       return reply.code(409).send({ error: "visit_not_editable", status: visit.status });
     }
@@ -412,6 +413,7 @@ export async function registerVisitRoutes(
       const actor = request.authUser;
       if (!actor) return reply.code(401).send({ error: "unauthorized" });
 
+      const visit = await loadVisitForWrite(prisma, request.params.id, actor, request.branchId!);
       const evidence = await prisma.visitEvidence.findFirst({
         where: { id: request.params.evidenceId, visitId: request.params.id },
       });
@@ -463,7 +465,7 @@ export async function registerVisitRoutes(
     async (request, reply) => {
       const actor = request.authUser;
       if (!actor) return reply.code(401).send({ error: "unauthorized" });
-      const visit = await loadVisitForWrite(prisma, request.params.id, actor);
+      const visit = await loadVisitForWrite(prisma, request.params.id, actor, request.branchId!);
       if (visit.status === "approved") return reply.code(409).send({ error: "visit_not_editable" });
 
       const evidence = await prisma.visitEvidence.findFirst({
@@ -497,7 +499,7 @@ export async function registerVisitRoutes(
     if (!parsed.success) {
       return reply.code(400).send({ error: "invalid_visit_submission", issues: parsed.error.issues });
     }
-    const visit = await loadVisitForWrite(prisma, request.params.id, actor);
+    const visit = await loadVisitForWrite(prisma, request.params.id, actor, request.branchId!);
     if (visit.status !== "assigned" && visit.status !== "in_progress" && visit.status !== "returned") {
       return reply.code(409).send({ error: "visit_not_submittable", status: visit.status });
     }
@@ -575,7 +577,9 @@ export async function registerVisitRoutes(
     if (!parsed.success) {
       return reply.code(400).send({ error: "invalid_return", issues: parsed.error.issues });
     }
-    const visit = await prisma.visit.findUnique({ where: { id: request.params.id } });
+    const visit = await prisma.visit.findFirst({
+      where: { id: request.params.id, case: { branches: { some: { branchId: request.branchId! } } } },
+    });
     if (!visit) return reply.code(404).send({ error: "visit_not_found" });
     if (visit.status !== "captured") {
       return reply.code(409).send({ error: "visit_not_returnable", status: visit.status });
@@ -640,7 +644,9 @@ export async function registerVisitRoutes(
     if (!parsed.success) {
       return reply.code(400).send({ error: "invalid_approval", issues: parsed.error.issues });
     }
-    const visit = await prisma.visit.findUnique({ where: { id: request.params.id } });
+    const visit = await prisma.visit.findFirst({
+      where: { id: request.params.id, case: { branches: { some: { branchId: request.branchId! } } } },
+    });
     if (!visit) return reply.code(404).send({ error: "visit_not_found" });
     if (visit.status !== "captured") {
       return reply.code(409).send({ error: "visit_not_approvable", status: visit.status });

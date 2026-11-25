@@ -18,6 +18,7 @@ import { emptyIntake } from "./intake";
 import { authorizedFetch } from "./supabase";
 import { useAuth } from "@/components/AuthGate";
 import { ROLE_LABELS, rolePersona, userInitials } from "./auth";
+import { ACTIVE_BRANCH_STORAGE_KEY, type Branch } from "./branches";
 
 const KEY = "ayavelisa:field:v2";
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -34,6 +35,13 @@ type Ctx = StoreState & {
   databaseStatus: "loading" | "connected" | "saving" | "error";
   databaseError: string | null;
   retryDatabase: () => Promise<void>;
+  branches: Branch[];
+  activeBranch: Branch | null;
+  activeBranchId: string | null;
+  branchesLoading: boolean;
+  branchError: string | null;
+  selectBranch: (branchId: string) => void;
+  refreshBranches: (options?: { keepActive?: boolean }) => Promise<void>;
   setPersona: (p: Persona) => void;
   setSeed: (s: SeedKind) => void;
   resetDemo: () => void;
@@ -81,10 +89,10 @@ const StoreContext = createContext<Ctx | null>(null);
 
 const isDatabaseAvailable = (status: Ctx["databaseStatus"]) => status === "connected" || status === "saving";
 
-function load(): StoreState {
+function load(storageKey = KEY): StoreState {
   if (typeof window === "undefined") return seedFor("mid_day");
   try {
-    const raw = window.localStorage.getItem(KEY);
+    const raw = window.localStorage.getItem(storageKey);
     if (!raw) return seedFor("mid_day");
     const p = JSON.parse(raw) as Partial<StoreState>;
     const base = seedFor(p.seedKind ?? "mid_day");
@@ -113,10 +121,11 @@ function load(): StoreState {
   } catch { return seedFor("mid_day"); }
 }
 
-function nextIntakeId(all: Intake[]): string {
+function nextIntakeId(all: Intake[], branchId: string): string {
   const year = new Date().getFullYear();
   const max = all.reduce((m, i) => { const n = Number(i.id.split("-")[2]); return Number.isFinite(n) && n > m ? n : m; }, 0);
-  return `INT-${year}-${String(max + 1).padStart(4, "0")}`;
+  const suffix = branchId === "eastern-cape-delivery" ? "" : `-${branchId.slice(0, 6).toUpperCase()}`;
+  return `INT-${year}-${String(max + 1).padStart(4, "0")}${suffix}`;
 }
 
 /** Convert an API Visit into the client Visit shape + version. */
@@ -164,11 +173,16 @@ const versionOf = (v: Visit | undefined): number => (v as any)?.version ?? 1;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<StoreState>(load);
-  const { user } = useAuth();
+  const { user, protectedMode } = useAuth();
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [activeBranchId, setActiveBranchIdState] = useState<string | null>(null);
+  const [branchesLoading, setBranchesLoading] = useState(true);
+  const [branchError, setBranchError] = useState<string | null>(null);
   const persona = user ? rolePersona(user.role) : state.persona;
   const currentUser = user
     ? { name: user.name, role: ROLE_LABELS[user.role], initials: userInitials(user.name, user.email) }
     : USERS[state.persona];
+  const activeBranch = branches.find((branch) => branch.id === activeBranchId) ?? null;
 
   const [isSyncing, setIsSyncing] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
@@ -183,6 +197,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const flushInProgress = useRef(false);
 
   const databaseVersion = useRef(0);
+  const activeBranchIdRef = useRef<string | null>(activeBranchId);
+  activeBranchIdRef.current = activeBranchId;
   const databaseStatusRef = useRef(databaseStatus);
   const saveTimer = useRef<number | null>(null);
   const writeInProgress = useRef(false);
@@ -197,11 +213,55 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setDatabaseError(error);
   }, []);
 
+  const refreshBranches = useCallback(async (options?: { keepActive?: boolean }) => {
+    setBranchesLoading(true);
+    setBranchError(null);
+    const previousBranchId = options?.keepActive ? activeBranchIdRef.current : null;
+    try {
+      const response = await authorizedFetch("/api/branches/mine");
+      const result = await response.json() as { branches?: Branch[]; error?: string };
+      if (!response.ok || !result.branches?.length) {
+        throw new Error(result.error ?? "No active branches are assigned to your account. Ask an administrator to assign a branch.");
+      }
+      setBranches(result.branches);
+      if (result.branches.length === 1) {
+        const onlyBranch = result.branches[0];
+        setActiveBranchIdState(onlyBranch.id);
+        window.localStorage.setItem(ACTIVE_BRANCH_STORAGE_KEY, onlyBranch.id);
+      } else if (previousBranchId && result.branches.some((branch) => branch.id === previousBranchId)) {
+        setActiveBranchIdState(previousBranchId);
+        window.localStorage.setItem(ACTIVE_BRANCH_STORAGE_KEY, previousBranchId);
+      } else {
+        setActiveBranchIdState(null);
+        window.localStorage.removeItem(ACTIVE_BRANCH_STORAGE_KEY);
+      }
+    } catch (error) {
+      setBranchError(error instanceof Error ? error.message : "Could not load your branches.");
+      setDatabaseStatus("error", error instanceof Error ? error.message : "Could not load your branches.");
+    } finally {
+      setBranchesLoading(false);
+    }
+  }, [setDatabaseStatus]);
+
+  const selectBranch = useCallback((branchId: string) => {
+    if (!branches.some((branch) => branch.id === branchId) || branchId === activeBranchId) return;
+    setActiveBranchIdState(branchId);
+    window.localStorage.setItem(ACTIVE_BRANCH_STORAGE_KEY, branchId);
+    databaseVersion.current = 0;
+    pendingState.current = null;
+    lastSavedState.current = null;
+    setDatabaseStatus("loading");
+  }, [activeBranchId, branches, setDatabaseStatus]);
+
+  useEffect(() => { void refreshBranches(); }, [refreshBranches]);
+
   /* --- /api/state blob ---------------------------------------------------- */
 
   useEffect(() => {
+    if (branchesLoading || !activeBranchId) return;
     const controller = new AbortController();
     const initialize = async () => {
+      setDatabaseStatus("loading");
       try {
         const response = await authorizedFetch("/api/state", { signal: controller.signal });
         if (!response.ok) throw new Error(`Database connection failed (${response.status})`);
@@ -210,6 +270,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (result.state) {
           lastSavedState.current = result.state;
           setState(result.state);
+        } else {
+          lastSavedState.current = null;
+          const cacheKey = `${KEY}:${activeBranchId}`;
+          const cachedState = window.localStorage.getItem(cacheKey);
+          setState(cachedState
+            ? load(cacheKey)
+            : seedFor(protectedMode ? "empty" : "mid_day"));
         }
         setDatabaseStatus("connected");
       } catch (error) {
@@ -219,7 +286,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
     void initialize();
     return () => controller.abort();
-  }, [setDatabaseStatus]);
+  }, [activeBranchId, branchesLoading, protectedMode, setDatabaseStatus]);
 
   useEffect(() => {
     const up = () => setIsOnline(true); const down = () => setIsOnline(false);
@@ -228,12 +295,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    try { window.localStorage.setItem(KEY, JSON.stringify(state)); }
+    const storageKey = activeBranchId ? `${KEY}:${activeBranchId}` : KEY;
+    try { window.localStorage.setItem(storageKey, JSON.stringify(state)); }
     catch { console.warn("localStorage quota exceeded"); }
-  }, [state]);
+  }, [activeBranchId, state]);
 
   useEffect(() => {
-    if ((databaseStatus !== "connected" && databaseStatus !== "saving") || state === lastSavedState.current) return;
+    if (!activeBranchId || (databaseStatus !== "connected" && databaseStatus !== "saving") || state === lastSavedState.current) return;
     pendingState.current = state;
     if (databaseStatus === "connected") {
       setDatabaseStatus("saving");
@@ -281,9 +349,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return () => {
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
     };
-  }, [state, databaseStatus, setDatabaseStatus]);
+  }, [activeBranchId, state, databaseStatus, setDatabaseStatus]);
 
   const retryDatabase = useCallback(async () => {
+    if (!activeBranchId) {
+      await refreshBranches();
+      return;
+    }
     setDatabaseStatus("loading");
     try {
       const response = await authorizedFetch("/api/state");
@@ -296,7 +368,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       setDatabaseStatus("error", error instanceof Error ? error.message : "Could not reconnect to the database");
     }
-  }, [setDatabaseStatus]);
+  }, [activeBranchId, refreshBranches, setDatabaseStatus]);
 
   const act = (kind: Activity["kind"], tone: Activity["tone"], title: string, detail: string): Activity => ({
     id: uid(), kind, tone, title, detail, time: "Just now", at: new Date().toISOString(),
@@ -321,7 +393,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }, 0);
     const created: CaseRecord = {
       ...draft,
-      id: `AY-${year}-${String(max + 1).padStart(4, "0")}`,
+      id: `AY-${year}-${String(max + 1).padStart(4, "0")}${activeBranchId && activeBranchId !== "eastern-cape-delivery" ? `-${activeBranchId.slice(0, 6).toUpperCase()}` : ""}`,
       verification: "Awaiting review",
       verificationTone: "warning",
       subsidy: "Not started",
@@ -340,7 +412,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }, ...s.auditLog],
     }));
     return created;
-  }, [state.cases, currentUser.name, persona]);
+  }, [state.cases, currentUser.name, persona, activeBranchId]);
 
   const updateCaseRecord = useCallback((id: string, patch: Partial<CaseRecord>) => setState((s) => {
     const before = s.cases.find((item) => item.id === id);
@@ -829,13 +901,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const createIntakeDraft = useCallback((): Intake => {
     let created: Intake | null = null;
     setState((s) => {
-      const id = nextIntakeId(s.intakes);
+      const id = nextIntakeId(s.intakes, activeBranchId ?? "eastern-cape-delivery");
       created = emptyIntake(id, currentUser.name);
       return { ...s, intakes: [created, ...s.intakes], activities: [act("intake", "sand", "Intake draft started", id), ...s.activities].slice(0, 40) };
     });
-    if (!created) created = emptyIntake(nextIntakeId(state.intakes), currentUser.name);
+    if (!created) created = emptyIntake(nextIntakeId(state.intakes, activeBranchId ?? "eastern-cape-delivery"), currentUser.name);
     return created;
-  }, [state.intakes, currentUser.name]);
+  }, [state.intakes, currentUser.name, activeBranchId]);
 
   const saveIntake = useCallback((i: Intake) => setState((s) => ({ ...s, intakes: s.intakes.map((x) => x.id === i.id ? i : x) })), []);
 
@@ -850,7 +922,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (!intake) return s;
       const year = new Date().getFullYear();
       const maxCase = s.cases.reduce((m, c) => { const n = Number(c.id.split("-")[2]); return Number.isFinite(n) && n > m ? n : m; }, 121);
-      const caseId = `AY-${year}-${String(maxCase + 1).padStart(4, "0")}`;
+      const suffix = activeBranchId && activeBranchId !== "eastern-cape-delivery" ? `-${activeBranchId.slice(0, 6).toUpperCase()}` : "";
+      const caseId = `AY-${year}-${String(maxCase + 1).padStart(4, "0")}${suffix}`;
       const surname = intake.applicantSurname.trim();
       const locality = [intake.location.village, intake.location.ward].filter(Boolean).join(" · ");
       const sources = intake.programmes.map((p) => ({ listName: p.listName, reference: p.reference, importedAt: new Date().toISOString() }));
@@ -875,7 +948,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(9, 0, 0, 0);
       const maxVisit = s.visits.reduce((m, v) => { const n = Number(v.id.split("-")[2]); return Number.isFinite(n) && n > m ? n : m; }, 1000);
       const visit: Visit = {
-        id: `V-${year}-${String(maxVisit + 1).padStart(4, "0")}`,
+        id: `V-${year}-${String(maxVisit + 1).padStart(4, "0")}${suffix}`,
         caseId, assignedTo: intake.capturedBy,
         scheduledFor: tomorrow.toISOString(),
         status: "assigned", form: null, evidence: [],
@@ -891,7 +964,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       };
     });
     return newCase;
-  }, [currentUser.name]);
+  }, [currentUser.name, activeBranchId]);
 
   const linkIntake = useCallback((id: string, caseId: string, reason: string) => setState((s) => ({ ...s, intakes: s.intakes.map((i) => i.id === id ? { ...i, status: "linked_to_existing" as const, linkedToCaseId: caseId, reviewedAt: new Date().toISOString(), reviewedBy: currentUser.name, duplicateResolution: "linked" as const, duplicateResolutionReason: reason } : i), activities: [act("intake", "sage", "Intake linked to existing case", `${id} → ${caseId}`), ...s.activities].slice(0, 40) })), [currentUser.name]);
 
@@ -902,6 +975,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const value = useMemo<Ctx>(() => ({
     ...state, visits: visitsLoaded ? visitsFromApi : state.visits, persona, currentUser, isOnline, isSyncing,
     databaseStatus, databaseError, retryDatabase,
+    branches, activeBranch, activeBranchId, branchesLoading, branchError, selectBranch, refreshBranches,
     setPersona, setSeed, resetDemo,
     startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
     createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,
@@ -911,6 +985,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     pendingQueueCount, refreshVisits, refreshPendingQueue, retryStuckItem,
   }), [
     state, visitsFromApi, visitsLoaded, persona, currentUser, isOnline, isSyncing, databaseStatus, databaseError, retryDatabase,
+    branches, activeBranch, activeBranchId, branchesLoading, branchError, selectBranch, refreshBranches,
     setPersona, setSeed, resetDemo,
     startVisit, saveVisitForm, addEvidence, removeEvidence, submitVisit, returnVisit, approveVisit, runSync,
     createCase, updateCaseRecord, archiveCase, restoreCase, assignCases, runVerifyNowChecks, markDepartmentPacketExported,

@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   ArrowRight, Bell, CalendarDays, ChevronDown, ClipboardCheck, ClipboardList, Database, FileText,
-  LayoutDashboard, Map, Menu, MoreHorizontal, RefreshCw, SlidersHorizontal, Users, Wifi, WifiOff, X,
+  LayoutDashboard, Map, Menu, MoreHorizontal, PanelLeftClose, PanelLeftOpen, RefreshCw,
+  SlidersHorizontal, Users, Wifi, WifiOff, X,
 } from "lucide-react";
 import { navigate, useRoute } from "@/lib/router";
 import { StoreProvider, useStore, USERS } from "@/lib/store";
@@ -49,23 +50,68 @@ function canAccessPath(role: AccountRole | null, path: string) {
 function Shell() {
   const { path } = useRoute();
   const { user, protectedMode } = useAuth();
-  const { sync, isSyncing, isOnline, persona: localPersona, setPersona, currentUser, databaseStatus, databaseError, retryDatabase } = useStore();
+  const {
+    sync, isSyncing, isOnline, persona: localPersona, setPersona, currentUser, databaseStatus,
+    databaseError, retryDatabase, branches, activeBranch, activeBranchId, branchesLoading,
+    branchError, selectBranch,
+  } = useStore();
   const persona = user ? rolePersona(user.role) : localPersona;
   const displayUser = user
     ? { name: user.name, role: ROLE_LABELS[user.role], initials: userInitials(user.name, user.email) }
     : currentUser;
   const { notify } = useToast();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   useEffect(() => {
     if (path === "/" && (persona === "fieldworker" || persona === "reviewer")) navigate(HOME[persona]);
   }, [path, persona]);
 
+  if (branchesLoading) {
+    return (
+      <main className="database-loading" role="status">
+        <Database size={22} />
+        <strong>Loading your branches</strong>
+        <span>Checking your branch access…</span>
+      </main>
+    );
+  }
+  if (branchError) {
+    return (
+      <main className="database-loading" role="alert">
+        <Database size={22} />
+        <strong>Could not load your branches</strong>
+        <span>{branchError}</span>
+        <button className="button button-primary" type="button" onClick={() => void retryDatabase()}>Try again</button>
+      </main>
+    );
+  }
+  if (branches.length > 1 && !activeBranch) {
+    return (
+      <main className="branch-landing">
+        <div className="branch-landing-card">
+          <div className="brand-mark"><span>A</span><span>V</span></div>
+          <span className="section-eyebrow">Ayavelisa workspace</span>
+          <h1>Select a branch</h1>
+          <p>Choose the branch workspace you want to open. You can switch branches later from the sidebar.</p>
+          <div className="branch-landing-list">
+            {branches.map((branch) => (
+              <button key={branch.id} type="button" className="branch-landing-option" onClick={() => selectBranch(branch.id)}>
+                <span className="workspace-dot" />
+                <span><strong>{branch.name}</strong>{branch.isDefault && <small>Default branch</small>}</span>
+                <ArrowRight size={17} />
+              </button>
+            ))}
+          </div>
+        </div>
+      </main>
+    );
+  }
   if (databaseStatus === "loading") {
     return (
       <main className="database-loading" role="status">
         <Database size={22} />
-        <strong>Opening your shared workspace</strong>
+        <strong>Opening {activeBranch?.name ?? "your workspace"}</strong>
         <span>Connecting to the database…</span>
       </main>
     );
@@ -154,7 +200,7 @@ function Shell() {
 
   return (
     <div className="app-shell">
-      <aside className={cx("sidebar", mobileNavOpen && "sidebar-open")}>
+      <aside id="main-sidebar" className={cx("sidebar", mobileNavOpen && "sidebar-open", sidebarCollapsed && "sidebar-collapsed")}>
         <div className="brand">
           <div className="brand-mark"><span>A</span><span>V</span></div>
           <div><strong>ayavelisa</strong><span>human settlements</span></div>
@@ -162,7 +208,20 @@ function Shell() {
         </div>
         <div className="sidebar-context">
           <span className="context-label">WORKSPACE</span>
-          <button type="button" className="workspace-switch"><span className="workspace-dot" />Eastern Cape delivery<ChevronDown size={14} /></button>
+          <label className="workspace-select-label">
+            <span className="workspace-dot" />
+            <select
+              className="workspace-switch"
+              value={activeBranchId ?? ""}
+              onChange={(event) => selectBranch(event.target.value)}
+              disabled={databaseStatus === "saving"}
+              aria-label="Select workspace branch"
+              title={activeBranch?.name}
+            >
+              {branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.name}{branch.isDefault ? " · Default" : ""}</option>)}
+            </select>
+            <ChevronDown size={14} />
+          </label>
         </div>
         <nav className="main-nav" aria-label="Main navigation">
           {nav.map(({ label, icon: Icon, count, path: p }) => (
@@ -170,6 +229,8 @@ function Shell() {
               type="button" key={label}
               className={cx("nav-item", (activePath === p || (p !== "/" && activePath.startsWith(`${p}/`))) && "nav-active")}
               onClick={() => { setMobileNavOpen(false); navigate(p); }}
+              title={sidebarCollapsed ? label : undefined}
+              aria-label={label}
             >
               <Icon size={17} strokeWidth={1.8} /><span>{label}</span>{count && <em>{count}</em>}
             </button>
@@ -177,29 +238,42 @@ function Shell() {
         </nav>
         <div className="sidebar-rule" />
         <div className="sidebar-section-label">QUICK ACCESS</div>
-        <button type="button" className="nav-item" onClick={() => { setMobileNavOpen(false); navigate(persona === "fieldworker" ? "/field/visits?filter=To do" : "/cases?filter=Needs%20action"); }}>
+        <button type="button" className="nav-item" title={sidebarCollapsed ? "My assignments" : undefined} aria-label="My assignments" onClick={() => { setMobileNavOpen(false); navigate(persona === "fieldworker" ? "/field/visits?filter=To do" : "/cases?filter=Needs%20action"); }}>
           <ClipboardCheck size={17} strokeWidth={1.8} /><span>My assignments</span><em className="nav-alert">8</em>
         </button>
-        <button type="button" className="nav-item"><Bell size={17} strokeWidth={1.8} /><span>Notifications</span><em className="nav-alert">3</em></button>
+        <button type="button" className="nav-item" title={sidebarCollapsed ? "Notifications" : undefined} aria-label="Notifications"><Bell size={17} strokeWidth={1.8} /><span>Notifications</span><em className="nav-alert">3</em></button>
         <div className="sidebar-bottom">
-          <div className="role-card">
+          <div className="role-card" title={sidebarCollapsed ? `${displayUser.name} · ${displayUser.role}` : undefined}>
             <div className="avatar">{displayUser.initials}</div>
             <div><strong>{displayUser.name}</strong><span>{displayUser.role}</span></div>
-            <MoreHorizontal size={16} />
+            <MoreHorizontal className="role-menu-icon" size={16} />
           </div>
           <div className="sidebar-footer">
-            <span>{isOnline ? <><Wifi size={13} />Connected</> : <><WifiOff size={13} />Offline</>}</span>
-            <span>v0.3 demo</span>
+            <span title={isOnline ? "Connected" : "Offline"}>{isOnline ? <><Wifi size={13} />Connected</> : <><WifiOff size={13} />Offline</>}</span>
+            <span className="sidebar-version">v0.3 demo</span>
           </div>
         </div>
       </aside>
 
       <div className="app-main">
         <header className="topbar">
-          <button className="mobile-menu icon-button" type="button" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu size={19} /></button>
-          <div className="breadcrumbs">
-            <span>Ayavelisa</span><ArrowRight size={13} />
-            <strong>{breadcrumbLabel}</strong>
+          <div className="topbar-leading">
+            <button className="mobile-menu icon-button" type="button" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu size={19} /></button>
+            <button
+              className="sidebar-toggle icon-button"
+              type="button"
+              onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!sidebarCollapsed}
+              aria-controls="main-sidebar"
+              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+            </button>
+            <div className="breadcrumbs">
+              <span>Ayavelisa</span><ArrowRight size={13} />
+              <strong>{breadcrumbLabel}</strong>
+            </div>
           </div>
           <div className="topbar-actions">
             {!protectedMode && <div className="persona-switcher">
