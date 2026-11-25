@@ -15,4 +15,4 @@ RUN pnpm run build
 
 ENV NODE_ENV=production
 EXPOSE 3000
-CMD ["sh", "-c", "pnpm run db:push && pnpm start"]
+CMD ["sh", "-c", "pnpm run db:push:deploy && pnpm start"]
